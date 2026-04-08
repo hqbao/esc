@@ -98,8 +98,9 @@ static uint16_t read_angle_raw(void) {
 static void on_scheduler_1khz(uint8_t *data, size_t size) {
     uint16_t raw = read_angle_raw();
 
-    // Mechanical angle 0–360°
-    float mech_angle = 360.0f * (float)raw / (float)AS5048A_COUNTS;
+    // Mechanical angle 0–360° (negated: encoder counts opposite to field direction)
+    float mech_angle = 360.0f - 360.0f * (float)raw / (float)AS5048A_COUNTS;
+    if (mech_angle >= 360.0f) mech_angle -= 360.0f;
 
     if (g_warmup > 0) {
         g_warmup--;

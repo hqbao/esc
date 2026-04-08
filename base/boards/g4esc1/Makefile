@@ -36,6 +36,7 @@ VPATH += $(MODULES_DIR)/foc
 VPATH += $(MODULES_DIR)/current_sense
 VPATH += $(MODULES_DIR)/voltage_monitor
 VPATH += $(MODULES_DIR)/encoder
+VPATH += $(MODULES_DIR)/dblink
 
 # C sources — local (relative to board dir)
 C_SOURCES = \
@@ -84,7 +85,8 @@ pubsub.c \
 foc.c \
 current_sense.c \
 voltage_monitor.c \
-encoder.c
+encoder.c \
+dblink.c
 
 # ASM sources
 ASM_SOURCES = \

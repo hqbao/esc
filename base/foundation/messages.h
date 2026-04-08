@@ -41,6 +41,8 @@ typedef struct {
 #define LOG_CLASS_FOC          1
 #define LOG_CLASS_CURRENT      2
 #define LOG_CLASS_VOLTAGE      3
+#define LOG_CLASS_RAW_CURRENT  4
 #define LOG_CLASS_ENCODER      5
+#define LOG_CLASS_OPENLOOP     6
 
 #endif // MESSAGES_H

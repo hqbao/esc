@@ -1,244 +1,194 @@
-// Sensorless FOC for B-G431B-ESC1 — BEMF Sliding Mode Observer + PLL
+// ═══════════════════════════════════════════════════════════════════════════
+// Standard Field-Oriented Control with AS5048A Encoder
 //
-// Combines two modes:
-//   1. Open-loop V/f sinusoidal commutation for startup (ALIGN → RAMP)
-//   2. Closed-loop using BEMF observer angle estimation (RUN)
+// Checkpoint-based development:
+//   CP1: Open-loop + encoder direction/pole pairs     [PASSED]
+//   CP2: Encoder offset calibration
+//   CP3: Clarke transform verification
+//   CP4: Park transform verification
+//   CP5: Closed-loop current control
+//   CP6: Speed control
 //
-// The Sliding Mode Observer (SMO) estimates back-EMF from measured phase
-// currents and reconstructed applied voltages. A Phase-Locked Loop (PLL)
-// tracks the BEMF vector angle to extract the rotor electrical angle and
-// speed. During startup, BEMF is too weak for tracking, so forced open-loop
-// commutation is used. Once the observer converges, it takes over.
-//
-// Motor model in α-β (Clarke) frame:
-//   di_α/dt = (1/L) · (v_α − R·i_α − e_α)
-//   di_β/dt = (1/L) · (v_β − R·i_β − e_β)
-//
-// BEMF: e_α = −λ·ω·sin(θ), e_β = λ·ω·cos(θ)
-// PLL error: e_α·cos(θ_est) + e_β·sin(θ_est) = λ·ω·sin(θ_est − θ)
+// Pipeline (closed-loop):
+//   Measure:  Iu,Iv,Iw (ADC) + theta_enc (encoder) + Vbus (ADC)
+//   Clarke:   Iu,Iv,Iw -> Ia, Ib
+//   Park:     Ia,Ib,theta -> Id,Iq
+//   PI:       Id_ref=0, Iq_ref -> Vd,Vq
+//   InvPark:  Vd,Vq,theta -> Va,Vb
+//   SVM:      Va,Vb -> Da,Db,Dc -> PWM
+// ═══════════════════════════════════════════════════════════════════════════
 
 #include "foc.h"
+#include "foc_math.h"
 #include <pubsub.h>
 #include <platform.h>
 #include <messages.h>
 #include <macro.h>
+#include <pi_controller.h>
 #include <string.h>
 #include <math.h>
 
-// ── 3-phase sine lookup table ──────────────────────────────────────────────
-static float g_phases[SINE_TABLE_SIZE][3];
+// ── Sine table (open-loop commutation) ─────────────────────────────────────
 
-static void create_lookup_table(void) {
+static float g_sine[SINE_TABLE_SIZE][3];
+
+static void create_sine_table(void) {
     float step = TWO_PI / (float)SINE_TABLE_SIZE;
-    float angle = 0.0f;
     for (int i = 0; i < SINE_TABLE_SIZE; i++) {
-        g_phases[i][0] = sinf(angle);
-        g_phases[i][1] = sinf(angle + TWO_PI / 3.0f);
-        g_phases[i][2] = sinf(angle + TWO_PI * 2.0f / 3.0f);
-        angle += step;
+        float a = step * (float)i;
+        g_sine[i][0] = sinf(a);
+        g_sine[i][1] = sinf(a + TWO_PI / 3.0f);
+        g_sine[i][2] = sinf(a + TWO_PI * 2.0f / 3.0f);
     }
 }
 
-// ── Observer constants ─────────────────────────────────────────────────────
-#define DT_40KHZ           (1.0f / 40000.0f)
+// ── Constants ──────────────────────────────────────────────────────────────
 
-// SMO tuning — adjust per motor
-#define SMO_GAIN           50.0f    // must exceed max BEMF voltage
-#define SMO_BANDWIDTH      0.5f     // saturation function bandwidth (Amps)
-#define BEMF_LPF_COEFF     0.02f    // BEMF low-pass filter (0–1, higher = faster)
-#define PLL_KP             200.0f   // PLL proportional gain
-#define PLL_KI             5000.0f  // PLL integral gain
-#define OBSERVER_MIN_SPEED 50.0f    // min ω (rad/s elec) to trust observer
-#define BEMF_MIN_MAG       0.5f     // min |BEMF| (V) to trust observer
-#define OMEGA_MAX          10000.0f // PLL speed clamp (rad/s)
+#define DT              (1.0f / 40000.0f)
+#define MAX_DUTY        ((float)PWM_PERIOD * 0.45f)
 
-// Saturation function: clamped linear ≈ sign() without chattering
-static inline float sat(float x, float h) {
-    float y = x / h;
-    if (y > 1.0f) return 1.0f;
-    if (y < -1.0f) return -1.0f;
-    return y;
-}
+// Open-loop
+#define OL_SPEED        0.005f  // 0.78 Hz electrical (slow for CP3/CP4 visualization)
+#define OL_AMPLITUDE    (0.35f * MAX_DUTY)
 
-// Clarke transform: 3-phase → α-β
-static inline void clarke(float a, float b, float c,
-                           float *alpha, float *beta) {
-    *alpha = (2.0f * a - b - c) / 3.0f;
-    *beta  = (b - c) / 1.7320508f;  // √3
-}
+// Startup
+#define ALIGN_TICKS     20000
+#define ALIGN_AMPLITUDE (0.35f * MAX_DUTY)
+#define RAMP_MIN_TICKS  4000
+#define RAMP_SPEED_INIT 0.005f
+#define RAMP_SPEED_INC  0.000003f
+#define RAMP_AMP_INIT   (0.15f * MAX_DUTY)
+#define RAMP_AMP_INC    (0.000004f * MAX_DUTY)
 
-// ── Observer state ─────────────────────────────────────────────────────────
-static float g_i_alpha_hat;    // estimated α current (A)
-static float g_i_beta_hat;     // estimated β current (A)
-static float g_bemf_alpha;     // filtered BEMF α (V)
-static float g_bemf_beta;      // filtered BEMF β (V)
-static float g_theta_est;      // estimated electrical angle (rad, 0–2π)
-static float g_omega_est;      // estimated electrical speed (rad/s)
-static float g_bemf_mag;       // |BEMF| for convergence check
-static uint8_t g_obs_valid;    // 1 when observer has converged
+// Calibration: 4 angles x 1s each, average last 25%
+#define CAL_STEPS       4
+#define CAL_TICKS       40000
+#define CAL_AVG_START   30000
 
-static void observer_reset(void) {
-    g_i_alpha_hat = 0.0f;
-    g_i_beta_hat  = 0.0f;
-    g_bemf_alpha  = 0.0f;
-    g_bemf_beta   = 0.0f;
-    g_theta_est   = 0.0f;
-    g_omega_est   = 0.0f;
-    g_bemf_mag    = 0.0f;
-    g_obs_valid   = 0;
-}
+// ── State ──────────────────────────────────────────────────────────────────
 
-static void observer_update(float i_u, float i_v, float i_w,
-                             float duty_u, float duty_v, float duty_w,
-                             float vbus) {
-    // Clarke transform on measured currents
-    float i_alpha, i_beta;
-    clarke(i_u, i_v, i_w, &i_alpha, &i_beta);
-
-    // Reconstruct applied phase voltages from duty cycles
-    float v_u = (duty_u / (float)PWM_PERIOD) * vbus;
-    float v_v = (duty_v / (float)PWM_PERIOD) * vbus;
-    float v_w = (duty_w / (float)PWM_PERIOD) * vbus;
-    float v_alpha, v_beta;
-    clarke(v_u, v_v, v_w, &v_alpha, &v_beta);
-
-    // Sliding mode: current estimation error → switching function
-    float err_alpha = g_i_alpha_hat - i_alpha;
-    float err_beta  = g_i_beta_hat  - i_beta;
-    float z_alpha = SMO_GAIN * sat(err_alpha, SMO_BANDWIDTH);
-    float z_beta  = SMO_GAIN * sat(err_beta,  SMO_BANDWIDTH);
-
-    // Observer current prediction (Euler forward)
-    float inv_L = 1.0f / MOTOR_INDUCTANCE;
-    g_i_alpha_hat += DT_40KHZ * inv_L *
-                     (v_alpha - MOTOR_RESISTANCE * g_i_alpha_hat - z_alpha);
-    g_i_beta_hat  += DT_40KHZ * inv_L *
-                     (v_beta  - MOTOR_RESISTANCE * g_i_beta_hat  - z_beta);
-
-    // Low-pass filter sliding mode output → estimated BEMF
-    g_bemf_alpha += BEMF_LPF_COEFF * (z_alpha - g_bemf_alpha);
-    g_bemf_beta  += BEMF_LPF_COEFF * (z_beta  - g_bemf_beta);
-
-    // BEMF magnitude
-    g_bemf_mag = sqrtf(g_bemf_alpha * g_bemf_alpha +
-                       g_bemf_beta  * g_bemf_beta);
-
-    // PLL: error = e_α·cos(θ̂) + e_β·sin(θ̂) = λω·sin(θ̂ − θ)
-    float sin_est = sinf(g_theta_est);
-    float cos_est = cosf(g_theta_est);
-    float pll_err = g_bemf_alpha * cos_est + g_bemf_beta * sin_est;
-
-    // PI controller on PLL error → speed and angle
-    g_omega_est += PLL_KI * pll_err * DT_40KHZ;
-    g_theta_est += (g_omega_est + PLL_KP * pll_err) * DT_40KHZ;
-
-    // Clamp speed (prevent runaway)
-    if (g_omega_est < 0.0f) g_omega_est = 0.0f;
-    if (g_omega_est > OMEGA_MAX) g_omega_est = OMEGA_MAX;
-
-    // Wrap angle to [0, 2π]
-    if (g_theta_est >= TWO_PI) g_theta_est -= TWO_PI;
-    if (g_theta_est < 0.0f)   g_theta_est += TWO_PI;
-
-    // Convergence: BEMF strong enough and speed above minimum
-    g_obs_valid = (g_bemf_mag > BEMF_MIN_MAG &&
-                   g_omega_est > OBSERVER_MIN_SPEED) ? 1 : 0;
-}
-
-// ── FOC state ──────────────────────────────────────────────────────────────
 typedef enum {
-    STATE_IDLE,
-    STATE_ALIGN,
-    STATE_RAMP,
-    STATE_RUN,
-} foc_state_e;
+    STATE_IDLE,         // 0
+    STATE_CALIBRATE,    // 1  CP2: lock at 4 angles, log encoder
+    STATE_ALIGN,        // 2  lock rotor, capture offset
+    STATE_RAMP,         // 3  open-loop acceleration
+    STATE_OPENLOOP,     // 4  steady open-loop (CP1/CP3/CP4)
+    STATE_CLOSEDLOOP,   // 5  full FOC (CP5/CP6)
+} state_e;
 
-static foc_state_e g_state;
-static float       g_ol_angle;       // open-loop angle (fractional table index)
-static float       g_ol_speed;       // open-loop speed (index/tick)
-static float       g_throttle;       // 0.0–1.0
-static float       g_amplitude;      // PWM amplitude (timer ticks)
-static uint32_t    g_align_counter;
-static uint32_t    g_ramp_counter;
-static uint8_t     g_active_log_class;
+static state_e  g_state;
+static float    g_throttle;
+static uint8_t  g_log_class;
 
-// Last applied duty cycles (for observer voltage reconstruction)
-static float       g_duty_u;
-static float       g_duty_v;
-static float       g_duty_w;
+// Open-loop
+static float    g_ol_angle;
+static float    g_ol_speed;
+static float    g_ol_speed_smooth;  // low-pass filtered speed
+static float    g_amplitude;
+static uint32_t g_align_cnt;
+static uint32_t g_ramp_cnt;
 
-// Latest sensor readings (updated by PubSub callbacks)
-static float       g_i_u, g_i_v, g_i_w;   // phase currents (A)
-static float       g_vbus = 12.0f;         // bus voltage (V)
+// Calibration
+static uint32_t g_cal_cnt;
+static uint8_t  g_cal_step;
+static float    g_cal_table_idx[CAL_STEPS];
+static float    g_cal_enc[CAL_STEPS];
+static float    g_cal_sin_sum[CAL_STEPS];
+static float    g_cal_cos_sum[CAL_STEPS];
+static uint32_t g_cal_avg_cnt;
 
-// Encoder angle (primary source, updated at 1 kHz)
-static float       g_encoder_angle;        // electrical angle (rad, 0–2π)
-static uint8_t     g_encoder_valid;
+// Encoder
+static float    g_enc_elec;
+static float    g_enc_offset;
+static uint8_t  g_enc_valid;
 
-#define MAX_AMPLITUDE  ((float)PWM_PERIOD * 0.45f)
+// Measurements
+static float    g_iu, g_iv, g_iw;
+static float    g_vbus = 12.0f;
 
-// Open-loop speed: table index increments per 40kHz tick at full throttle
-// ω_elec = SPEED * 40000 / TABLE_SIZE * 2π  (rad/s)
-// Example: 2.0 → 2·40000/256·2π ≈ 1963 rad/s → 312 Hz → 2676 RPM (7 poles)
-#define SPEED_AT_FULL_THROTTLE  2.0f
+// Clarke outputs
+static float    g_i_alpha, g_i_beta;
 
-// Startup parameters
-#define ALIGN_TICKS     8000       // 200 ms at 40 kHz
-#define RAMP_SPEED_INIT 0.05f
-#define RAMP_SPEED_INC  0.000005f
-#define RAMP_AMP_INIT   0.05f
-#define RAMP_AMP_INC    0.000002f
+// Park outputs
+static float    g_id, g_iq;
 
-// ── Apply 3-phase PWM ──────────────────────────────────────────────────────
+// FOC outputs
+static float    g_vd, g_vq;
+static float    g_v_alpha, g_v_beta;
 
-// From table index (open-loop path)
-static void apply_pwm_table(float step, float amplitude) {
+// Duty cycles
+static float    g_duty_a, g_duty_b, g_duty_c;
+
+// PI controllers
+static pi_controller_t g_pi_id = { .kp = 0.5f, .ki = 100.0f, .integral = 0.0f, .limit = 6.0f };
+static pi_controller_t g_pi_iq = { .kp = 0.5f, .ki = 100.0f, .integral = 0.0f, .limit = 6.0f };
+
+// ── Apply PWM ──────────────────────────────────────────────────────────────
+
+static void apply_openloop(float step, float amplitude) {
     int idx = (int)step;
     if (idx >= SINE_TABLE_SIZE) idx -= SINE_TABLE_SIZE;
     if (idx < 0) idx += SINE_TABLE_SIZE;
 
-    g_duty_u = (1.0f + g_phases[idx][0]) * amplitude;
-    g_duty_v = (1.0f + g_phases[idx][1]) * amplitude;
-    g_duty_w = (1.0f + g_phases[idx][2]) * amplitude;
+    g_duty_a = (1.0f + g_sine[idx][0]) * amplitude;
+    g_duty_b = (1.0f + g_sine[idx][1]) * amplitude;
+    g_duty_c = (1.0f + g_sine[idx][2]) * amplitude;
 
-    platform_pwm_set_duty(PWM_PHASE_U, (uint32_t)g_duty_u);
-    platform_pwm_set_duty(PWM_PHASE_V, (uint32_t)g_duty_v);
-    platform_pwm_set_duty(PWM_PHASE_W, (uint32_t)g_duty_w);
+    platform_pwm_set_duty(PWM_PHASE_U, (uint32_t)g_duty_a);
+    platform_pwm_set_duty(PWM_PHASE_V, (uint32_t)g_duty_b);
+    platform_pwm_set_duty(PWM_PHASE_W, (uint32_t)g_duty_c);
 }
 
-// From angle in radians (observer path)
-static void apply_pwm_angle(float angle_rad, float amplitude) {
-    float step = angle_rad * ((float)SINE_TABLE_SIZE / TWO_PI);
-    if (step >= (float)SINE_TABLE_SIZE) step -= (float)SINE_TABLE_SIZE;
-    if (step < 0.0f) step += (float)SINE_TABLE_SIZE;
-    apply_pwm_table(step, amplitude);
+static void apply_foc(float v_alpha, float v_beta) {
+    float va = v_alpha;
+    float vb = -0.5f * v_alpha + 0.86602540f * v_beta;
+    float vc = -0.5f * v_alpha - 0.86602540f * v_beta;
+
+    // SVPWM centering
+    float vmin = va;
+    float vmax = va;
+    if (vb < vmin) vmin = vb;
+    if (vb > vmax) vmax = vb;
+    if (vc < vmin) vmin = vc;
+    if (vc > vmax) vmax = vc;
+    float voff = -(vmin + vmax) * 0.5f;
+    va += voff;  vb += voff;  vc += voff;
+
+    float scale = (float)PWM_PERIOD / g_vbus;
+    float half = (float)PWM_PERIOD * 0.5f;
+    g_duty_a = half + va * scale;
+    g_duty_b = half + vb * scale;
+    g_duty_c = half + vc * scale;
+
+    float max_d = (float)PWM_PERIOD * 0.95f;
+    float min_d = (float)PWM_PERIOD * 0.05f;
+    g_duty_a = LIMIT(g_duty_a, min_d, max_d);
+    g_duty_b = LIMIT(g_duty_b, min_d, max_d);
+    g_duty_c = LIMIT(g_duty_c, min_d, max_d);
+
+    platform_pwm_set_duty(PWM_PHASE_U, (uint32_t)g_duty_a);
+    platform_pwm_set_duty(PWM_PHASE_V, (uint32_t)g_duty_b);
+    platform_pwm_set_duty(PWM_PHASE_W, (uint32_t)g_duty_c);
 }
 
-// ── Callbacks ──────────────────────────────────────────────────────────────
-
-static void on_phase_current(uint8_t *data, size_t size) {
-    if (size < sizeof(phase_current_t)) return;
-    phase_current_t c;
-    memcpy(&c, data, sizeof(c));
-    g_i_u = c.phase_u;
-    g_i_v = c.phase_v;
-    g_i_w = c.phase_w;
-}
+// ── Sensor callbacks ───────────────────────────────────────────────────────
 
 static void on_bus_voltage(uint8_t *data, size_t size) {
     if (size < sizeof(bus_measurement_t)) return;
     bus_measurement_t m;
     memcpy(&m, data, sizeof(m));
-    if (m.bus_voltage > 1.0f) g_vbus = m.bus_voltage;
+    g_vbus = m.bus_voltage;
 }
 
 static void on_encoder(uint8_t *data, size_t size) {
     if (size < sizeof(encoder_data_t)) return;
     encoder_data_t enc;
     memcpy(&enc, data, sizeof(enc));
-    g_encoder_angle = enc.electrical_angle;
-    g_encoder_valid = enc.valid;
+    g_enc_elec = enc.electrical_angle;
+    g_enc_valid = enc.valid;
 }
+
+// ── Throttle callback ──────────────────────────────────────────────────────
 
 static void on_motor_throttle(uint8_t *data, size_t size) {
     if (size < sizeof(motor_throttle_t)) return;
@@ -246,92 +196,266 @@ static void on_motor_throttle(uint8_t *data, size_t size) {
     memcpy(&cmd, data, sizeof(cmd));
     g_throttle = LIMIT(cmd.throttle, 0.0f, 1.0f);
 
-    if (g_throttle < 0.01f && g_state != STATE_IDLE) {
+    if (g_throttle < 0.01f && g_state != STATE_IDLE && g_state != STATE_CALIBRATE) {
         platform_pwm_stop();
         g_state = STATE_IDLE;
         g_ol_angle = 0.0f;
         g_ol_speed = 0.0f;
+        g_ol_speed_smooth = 0.0f;
         g_amplitude = 0.0f;
-        observer_reset();
-    } else if (g_throttle > 0.01f && g_state == STATE_IDLE) {
+        pi_controller_reset(&g_pi_id);
+        pi_controller_reset(&g_pi_iq);
+    }
+    else if (g_throttle > 0.01f && g_state == STATE_IDLE) {
         g_state = STATE_ALIGN;
-        g_align_counter = 0;
-        g_ramp_counter = 0;
+        g_align_cnt = 0;
+        g_ramp_cnt = 0;
         g_ol_angle = 0.0f;
         g_ol_speed = RAMP_SPEED_INIT;
-        g_amplitude = RAMP_AMP_INIT * MAX_AMPLITUDE;
-        observer_reset();
+        g_ol_speed_smooth = OL_SPEED;
+        g_amplitude = RAMP_AMP_INIT;
+        pi_controller_reset(&g_pi_id);
+        pi_controller_reset(&g_pi_iq);
         platform_pwm_start();
     }
 }
 
-// 40 kHz commutation tick (triggered by ADC injected → TIM1_CC4)
-static void on_adc_injected_complete(uint8_t *data, size_t size) {
+// ── Log class callback (also triggers calibration) ─────────────────────────
+
+static void on_notify_log_class(uint8_t *data, size_t size) {
+    if (size < 1) return;
+    uint8_t requested = data[0];
+
+    // LOG_CLASS_FOC (1) while IDLE = start calibration
+    if (requested == LOG_CLASS_FOC && g_state == STATE_IDLE) {
+        g_log_class = requested;
+        g_state = STATE_CALIBRATE;
+        g_cal_step = 0;
+        g_cal_cnt = 0;
+        g_cal_table_idx[0] = 0.0f;
+        g_cal_table_idx[1] = (float)SINE_TABLE_SIZE * 0.25f;
+        g_cal_table_idx[2] = (float)SINE_TABLE_SIZE * 0.50f;
+        g_cal_table_idx[3] = (float)SINE_TABLE_SIZE * 0.75f;
+        for (int i = 0; i < CAL_STEPS; i++) {
+            g_cal_enc[i] = 0.0f;
+            g_cal_sin_sum[i] = 0.0f;
+            g_cal_cos_sum[i] = 0.0f;
+        }
+        g_cal_avg_cnt = 0;
+        platform_pwm_start();
+        return;
+    }
+
+    g_log_class = requested;
+}
+
+// ── 40 kHz commutation (triggered by SENSOR_PHASE_CURRENT) ─────────────────
+
+static void on_commutate(uint8_t *data, size_t size) {
+    if (size < sizeof(phase_current_t)) return;
     if (g_state == STATE_IDLE) return;
 
+    // Read fresh phase currents from callback data
+    phase_current_t c;
+    memcpy(&c, data, sizeof(c));
+    g_iu = c.phase_u;
+    g_iv = c.phase_v;
+    g_iw = c.phase_w;
+
+    // Clarke transform
+    clarke(g_iu, g_iv, g_iw, &g_i_alpha, &g_i_beta);
+
+    // Calibrated rotor angle
+    float theta = g_enc_elec - g_enc_offset;
+    if (theta < 0.0f)    theta += TWO_PI;
+    if (theta >= TWO_PI) theta -= TWO_PI;
+
+    // Always compute Park
+    park(g_i_alpha, g_i_beta, theta, &g_id, &g_iq);
+
     switch (g_state) {
-    case STATE_ALIGN:
-        // Hold at fixed angle to lock rotor
-        apply_pwm_table(0.0f, 0.08f * MAX_AMPLITUDE);
-        if (++g_align_counter >= ALIGN_TICKS) {
-            g_state = STATE_RAMP;
-            g_ramp_counter = 0;
+
+    case STATE_CALIBRATE:
+        apply_openloop(g_cal_table_idx[g_cal_step], ALIGN_AMPLITUDE);
+        g_cal_cnt++;
+        // Average encoder angle over the last 25% using circular mean
+        if (g_cal_cnt >= CAL_AVG_START) {
+            g_cal_sin_sum[g_cal_step] += sinf(g_enc_elec);
+            g_cal_cos_sum[g_cal_step] += cosf(g_enc_elec);
+            g_cal_avg_cnt++;
+        }
+        if (g_cal_cnt >= CAL_TICKS) {
+            g_cal_enc[g_cal_step] = atan2f(g_cal_sin_sum[g_cal_step],
+                                           g_cal_cos_sum[g_cal_step]);
+            if (g_cal_enc[g_cal_step] < 0.0f)
+                g_cal_enc[g_cal_step] += TWO_PI;
+            g_cal_step++;
+            g_cal_cnt = 0;
+            g_cal_avg_cnt = 0;
+            if (g_cal_step >= CAL_STEPS) {
+                g_enc_offset = g_cal_enc[0];
+                platform_pwm_stop();
+                g_state = STATE_IDLE;
+            }
         }
         break;
 
-    case STATE_RAMP: {
-        // Open-loop forced commutation with increasing speed + voltage
+    case STATE_ALIGN:
+        apply_openloop(0.0f, ALIGN_AMPLITUDE);
+        if (++g_align_cnt >= ALIGN_TICKS) {
+            g_enc_offset = g_enc_elec;
+            g_state = STATE_RAMP;
+            g_ramp_cnt = 0;
+        }
+        break;
+
+    case STATE_RAMP:
         g_ol_angle += g_ol_speed;
         if (g_ol_angle >= (float)SINE_TABLE_SIZE)
             g_ol_angle -= (float)SINE_TABLE_SIZE;
 
         g_ol_speed  += RAMP_SPEED_INC;
-        g_amplitude += RAMP_AMP_INC * MAX_AMPLITUDE;
+        g_amplitude += RAMP_AMP_INC;
+        if (g_ol_speed > OL_SPEED)      g_ol_speed  = OL_SPEED;
+        if (g_amplitude > OL_AMPLITUDE)  g_amplitude = OL_AMPLITUDE;
 
-        float target_speed = g_throttle * SPEED_AT_FULL_THROTTLE;
-        float target_amp   = g_throttle * MAX_AMPLITUDE;
-        if (g_ol_speed > target_speed) g_ol_speed = target_speed;
-        if (g_amplitude > target_amp)  g_amplitude = target_amp;
+        apply_openloop(g_ol_angle, g_amplitude);
 
-        apply_pwm_table(g_ol_angle, g_amplitude);
-
-        // Run observer in background so it can converge before handoff
-        observer_update(g_i_u, g_i_v, g_i_w,
-                        g_duty_u, g_duty_v, g_duty_w, g_vbus);
-
-        if (++g_ramp_counter > 4000 && g_ol_speed >= target_speed) {
-            g_state = STATE_RUN;
+        if (++g_ramp_cnt > RAMP_MIN_TICKS && g_ol_speed >= OL_SPEED) {
+            if (g_log_class == LOG_CLASS_ENCODER) {
+                g_state = STATE_CLOSEDLOOP;
+            } else {
+                g_state = STATE_OPENLOOP;
+            }
         }
+        break;
+
+    case STATE_OPENLOOP: {
+        float speed_target = OL_SPEED + g_throttle * 0.15f;
+        g_ol_speed_smooth += (speed_target - g_ol_speed_smooth) * 0.0002f;  // ~1s ramp at 40kHz
+        g_amplitude = OL_AMPLITUDE;
+        g_ol_angle += g_ol_speed_smooth;
+        if (g_ol_angle >= (float)SINE_TABLE_SIZE)
+            g_ol_angle -= (float)SINE_TABLE_SIZE;
+        apply_openloop(g_ol_angle, g_amplitude);
         break;
     }
 
-    case STATE_RUN:
-        g_amplitude = g_throttle * MAX_AMPLITUDE;
+    case STATE_CLOSEDLOOP: {
+        float iq_ref = g_throttle * 5.0f;
+        float id_ref = 0.0f;
 
-        // Always run observer (fallback angle source)
-        observer_update(g_i_u, g_i_v, g_i_w,
-                        g_duty_u, g_duty_v, g_duty_w, g_vbus);
+        g_vd = pi_controller_update(&g_pi_id, id_ref - g_id, DT);
+        g_vq = pi_controller_update(&g_pi_iq, iq_ref - g_iq, DT);
 
-        if (g_encoder_valid) {
-            // Primary: commutate at encoder angle
-            apply_pwm_angle(g_encoder_angle, g_amplitude);
-        } else if (g_obs_valid) {
-            // Fallback: BEMF observer angle
-            apply_pwm_angle(g_theta_est, g_amplitude);
-        } else {
-            // Last resort: open-loop
-            g_ol_speed = g_throttle * SPEED_AT_FULL_THROTTLE;
-            g_ol_angle += g_ol_speed;
-            if (g_ol_angle >= (float)SINE_TABLE_SIZE)
-                g_ol_angle -= (float)SINE_TABLE_SIZE;
-            apply_pwm_table(g_ol_angle, g_amplitude);
-        }
+        inv_park(g_vd, g_vq, theta, &g_v_alpha, &g_v_beta);
+        apply_foc(g_v_alpha, g_v_beta);
         break;
+    }
 
     default:
         break;
     }
 }
+
+// ── Logging (25 Hz) ────────────────────────────────────────────────────────
+
+static void on_scheduler_25hz(uint8_t *data, size_t size) {
+    if (g_log_class == 0) return;
+
+    float log_data[8];
+
+    switch (g_log_class) {
+    case LOG_CLASS_FOC:
+        // CP2: Calibration data
+        // [0] state  [1] cal_step  [2] applied_angle(rad)  [3] enc_now(rad)
+        // [4] enc@0  [5] enc@90    [6] enc@180             [7] enc@270
+        log_data[0] = (float)g_state;
+        log_data[1] = (float)g_cal_step;
+        log_data[2] = (g_cal_step < CAL_STEPS)
+                       ? g_cal_table_idx[g_cal_step] * (TWO_PI / (float)SINE_TABLE_SIZE)
+                       : 0.0f;
+        log_data[3] = g_enc_elec;
+        log_data[4] = g_cal_enc[0];
+        log_data[5] = g_cal_enc[1];
+        log_data[6] = g_cal_enc[2];
+        log_data[7] = g_cal_enc[3];
+        break;
+
+    case LOG_CLASS_CURRENT:
+        // CP3: Clarke currents + phase currents
+        // [0] state  [1] Ia  [2] Ib  [3] enc_elec
+        // [4] Iu  [5] Iv  [6] Iw  [7] VBUS
+        log_data[0] = (float)g_state;
+        log_data[1] = g_i_alpha;
+        log_data[2] = g_i_beta;
+        log_data[3] = g_enc_elec;
+        log_data[4] = g_iu;
+        log_data[5] = g_iv;
+        log_data[6] = g_iw;
+        log_data[7] = g_vbus;
+        break;
+
+    case LOG_CLASS_OPENLOOP:
+        // CP1: Open-loop + encoder verification
+        // [0] state  [1] enc_elec  [2] ol_angle(rad)  [3] ol_speed_smooth
+        // [4] amplitude  [5] enc_offset  [6] VBUS  [7] throttle
+        log_data[0] = (float)g_state;
+        log_data[1] = g_enc_elec;
+        log_data[2] = g_ol_angle * (TWO_PI / (float)SINE_TABLE_SIZE);
+        log_data[3] = g_ol_speed_smooth * (TWO_PI / (float)SINE_TABLE_SIZE) * 40000.0f;
+        log_data[4] = g_amplitude;
+        log_data[5] = g_enc_offset;
+        log_data[6] = g_vbus;
+        log_data[7] = g_throttle;
+        break;
+
+    case LOG_CLASS_VOLTAGE:
+        // CP4: Park currents
+        // [0] state  [1] Id  [2] Iq  [3] theta_rotor
+        // [4] enc_elec  [5] enc_offset  [6] Ia  [7] Ib
+        log_data[0] = (float)g_state;
+        log_data[1] = g_id;
+        log_data[2] = g_iq;
+        {
+            float th = g_enc_elec - g_enc_offset;
+            if (th < 0.0f) th += TWO_PI;
+            if (th >= TWO_PI) th -= TWO_PI;
+            log_data[3] = th;
+        }
+        log_data[4] = g_enc_elec;
+        log_data[5] = g_enc_offset;
+        log_data[6] = g_i_alpha;
+        log_data[7] = g_i_beta;
+        break;
+
+    case LOG_CLASS_ENCODER:
+        // CP5: Current loop
+        // [0] state  [1] Id  [2] Iq  [3] Vd
+        // [4] Vq  [5] Iq_ref  [6] Id_ref  [7] theta
+        log_data[0] = (float)g_state;
+        log_data[1] = g_id;
+        log_data[2] = g_iq;
+        log_data[3] = g_vd;
+        log_data[4] = g_vq;
+        log_data[5] = g_throttle * 5.0f;
+        log_data[6] = 0.0f;
+        {
+            float th = g_enc_elec - g_enc_offset;
+            if (th < 0.0f) th += TWO_PI;
+            if (th >= TWO_PI) th -= TWO_PI;
+            log_data[7] = th;
+        }
+        break;
+
+    default:
+        return;
+    }
+
+    publish(SEND_LOG, (uint8_t *)log_data, sizeof(log_data));
+}
+
+// ── PWM enable/disable ─────────────────────────────────────────────────────
 
 static void on_foc_setup(uint8_t *data, size_t size) {
     platform_pwm_enable_phase(PWM_PHASE_U);
@@ -345,41 +469,22 @@ static void on_foc_release(uint8_t *data, size_t size) {
     g_throttle = 0.0f;
     g_ol_angle = 0.0f;
     g_ol_speed = 0.0f;
+    g_ol_speed_smooth = 0.0f;
     g_amplitude = 0.0f;
-    observer_reset();
-}
-
-static void on_notify_log_class(uint8_t *data, size_t size) {
-    if (size < 1) return;
-    g_active_log_class = (data[0] == LOG_CLASS_FOC) ? LOG_CLASS_FOC : 0;
-}
-
-static void on_scheduler_25hz(uint8_t *data, size_t size) {
-    if (g_active_log_class == 0) return;
-
-    float log_data[8] = {
-        (float)g_state,
-        g_encoder_angle,            // encoder electrical angle (rad)
-        g_theta_est,                // observer angle (rad)
-        g_omega_est,                // observer speed (rad/s electrical)
-        g_amplitude,                // PWM amplitude (ticks)
-        (float)g_encoder_valid,     // encoder valid flag
-        (float)g_obs_valid,         // observer converged flag
-        g_bemf_mag                  // |BEMF| (V)
-    };
-    publish(SEND_LOG, (uint8_t *)log_data, sizeof(log_data));
+    g_log_class = 0;
+    pi_controller_reset(&g_pi_id);
+    pi_controller_reset(&g_pi_iq);
 }
 
 // ── Setup ──────────────────────────────────────────────────────────────────
+
 void foc_setup(void) {
-    create_lookup_table();
-    observer_reset();
+    create_sine_table();
 
     subscribe(FOC_SETUP, on_foc_setup);
     subscribe(FOC_RELEASE, on_foc_release);
     subscribe(MOTOR_THROTTLE, on_motor_throttle);
-    subscribe(ADC_INJECTED_COMPLETE, on_adc_injected_complete);
-    subscribe(SENSOR_PHASE_CURRENT, on_phase_current);
+    subscribe(SENSOR_PHASE_CURRENT, on_commutate);
     subscribe(SENSOR_BUS_VOLTAGE, on_bus_voltage);
     subscribe(SENSOR_ENCODER, on_encoder);
     subscribe(NOTIFY_LOG_CLASS, on_notify_log_class);

@@ -20,20 +20,15 @@ static uint8_t g_active_log_class = 0;
 
 // ── Callbacks ──────────────────────────────────────────────────────────────
 
-// Called from ADC regular complete — data contains 2 × uint16_t (vbus, temp)
+// Called from ADC regular complete — data contains VBUS raw value (uint16_t, 12-bit)
 static void on_adc_regular(uint8_t *data, size_t size) {
-    if (size < 2 * sizeof(uint16_t)) return;
+    if (size < sizeof(uint16_t)) return;
 
-    uint16_t raw_vbus, raw_temp;
-    memcpy(&raw_vbus, &data[0], sizeof(uint16_t));
-    memcpy(&raw_temp, &data[2], sizeof(uint16_t));
+    uint16_t vbus_raw;
+    memcpy(&vbus_raw, data, sizeof(vbus_raw));
 
-    g_bus.bus_voltage = ADC_TO_VBUS(raw_vbus);
-
-    // NTC temperature: simplified linear approximation
-    // Full model would use Steinhart-Hart or lookup table
-    float v_temp = (float)raw_temp / (float)ADC_RESOLUTION * ADC_VREF;
-    g_bus.temperature = (v_temp - 1.5f) * 100.0f;  // placeholder linear
+    g_bus.bus_voltage = ADC_TO_VBUS(vbus_raw);
+    g_bus.temperature = 0;
 
     publish(SENSOR_BUS_VOLTAGE, (uint8_t *)&g_bus, sizeof(g_bus));
 }

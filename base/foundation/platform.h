@@ -36,6 +36,7 @@ uint8_t platform_encoder_miso_read(void);
 
 // UART
 char platform_uart_send(uart_port_t port, uint8_t *data, uint16_t size);
+void platform_uart_start_rx(void);
 
 // System
 void platform_led_on(void);

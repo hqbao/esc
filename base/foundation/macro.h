@@ -8,7 +8,7 @@
 #define PWM_PERIOD         2125
 
 // Motor parameters (B-G431B-ESC1 reference design)
-#define NUM_POLE_PAIRS     7       // Adjust per motor
+#define NUM_POLE_PAIRS     11      // Adjust per motor
 
 // Current sensing
 #define SHUNT_RESISTANCE   0.003f  // Ohms

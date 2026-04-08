@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Quick debug script — connect, start FOC log, read a few packets, show JSQR debug values."""
+import serial
+import serial.tools.list_ports
+import struct
+import time
+import sys
+
+BAUD_RATE = 19200
+LOG_CLASS_FOC = 1
+DB_CMD_LOG_CLASS = 0x03
+
+def find_port():
+    for port, desc, hwid in sorted(serial.tools.list_ports.comports()):
+        if '0483' in hwid:  # STM32 STLink VCP
+            print(f"Using: {port} ({desc})")
+            return port
+    # fallback
+    for port, desc, hwid in sorted(serial.tools.list_ports.comports()):
+        if any(x in port for x in ['usbmodem', 'usbserial', 'ttyACM', 'ttyUSB']):
+            print(f"Using: {port} ({desc})")
+            return port
+    print("No serial port found")
+    sys.exit(1)
+
+def build_db_packet(cmd_id, log_class, payload=b''):
+    size = len(payload)
+    header = struct.pack('<BBBBH', ord('d'), ord('b'), cmd_id, log_class, size)
+    frame = header + payload
+    checksum = sum(frame) & 0xFFFF
+    return frame + struct.pack('<H', checksum)
+
+def parse_db_frame(buf):
+    """Try to parse a DB frame from buffer. Returns (floats, remaining_buf) or (None, buf)."""
+    while len(buf) >= 8:
+        idx = buf.find(b'db')
+        if idx < 0:
+            return None, buf[-1:]  # keep last byte
+        buf = buf[idx:]
+        if len(buf) < 8:
+            return None, buf
+        cmd_id, log_class, size = struct.unpack_from('<BBH', buf, 2)
+        total = 6 + size + 2
+        if size > 120 or total > len(buf):
+            return None, buf
+        frame = buf[:6 + size]
+        checksum_expected = sum(frame) & 0xFFFF
+        checksum_actual = struct.unpack_from('<H', buf, 6 + size)[0]
+        if checksum_expected != checksum_actual:
+            buf = buf[2:]  # skip this 'db' and try next
+            continue
+        payload = buf[6:6 + size]
+        buf = buf[total:]
+        if size >= 32:  # 8 floats
+            floats = struct.unpack('<8f', payload[:32])
+            return floats, buf
+        return None, buf
+    return None, buf
+
+port = find_port()
+ser = serial.Serial(port, BAUD_RATE, timeout=1)
+time.sleep(0.5)
+ser.reset_input_buffer()
+
+# Send start log (LOG_CLASS_FOC=1) to trigger calibration + motor spin
+print("Sending LOG_CLASS_FOC...")
+ser.write(build_db_packet(DB_CMD_LOG_CLASS, LOG_CLASS_FOC))
+time.sleep(0.5)
+
+print("Reading packets for 8 seconds...")
+buf = b''
+count = 0
+start = time.time()
+while time.time() - start < 8:
+    chunk = ser.read(256)
+    if chunk:
+        buf += chunk
+    while True:
+        result, buf = parse_db_frame(buf)
+        if result is None:
+            break
+        count += 1
+        state, ia, ib, enc, dbg_raw, dbg_noshft, dbg_jdr3, dbg_jsqr = result
+        state_names = {0:'IDLE',1:'CAL',2:'ALIGN',3:'RAMP',4:'OL',5:'CL'}
+        state_name = state_names.get(int(state), '?')
+        
+        vbus = dbg_raw / 4096.0 * 3.3 / 0.09626 if dbg_raw > 0 else 0
+        
+        if count % 10 == 1 or count <= 5:
+            print(f"[{count:4d}] state={state_name:5s}  Ia={ia:+.4f} Ib={ib:+.4f}  "
+                  f"raw>>4={int(dbg_raw):4d}  noshft={int(dbg_noshft):5d}  "
+                  f"JSQR@hal=0x{int(dbg_jdr3):04X}  JSQR@start=0x{int(dbg_jsqr):04X}  "
+                  f"Vbus={vbus:.1f}V")
+
+print(f"\nTotal packets received: {count}")
+
+# Send stop (log_class 0)
+ser.write(build_db_packet(DB_CMD_LOG_CLASS, 0))
+time.sleep(0.2)
+ser.close()
+print("Done.")

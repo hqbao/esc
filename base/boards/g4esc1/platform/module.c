@@ -7,6 +7,7 @@
 #include <voltage_monitor/voltage_monitor.h>
 #include <encoder/encoder.h>
 #include <foc/foc.h>
+#include <dblink/dblink.h>
 
 // Start all analog hardware required before modules can run
 static void hw_init(void) {
@@ -27,7 +28,7 @@ static void hw_init(void) {
     HAL_DAC_Start(&hdac3, DAC_CHANNEL_1);
     HAL_DAC_Start(&hdac3, DAC_CHANNEL_2);
 
-    // ADC calibration (must happen before any conversion)
+    // ADC calibration (must happen before any conversion, ADC disabled)
     HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
     HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 }
@@ -40,16 +41,19 @@ void platform_setup(void) {
     voltage_monitor_setup();
     encoder_setup();
     foc_setup();
+    dblink_setup();
 
     // Start ADC injected conversions (triggered by TIM1_CC4)
     HAL_ADCEx_InjectedStart_IT(&hadc1);
     HAL_ADCEx_InjectedStart_IT(&hadc2);
 
-    // Start ADC regular conversion (VBUS + temp), software-triggered periodic
-    HAL_ADC_Start_IT(&hadc1);
+    // Regular ADC (VBUS + temp) is polled synchronously at 100Hz in platform_isr.c
 
     // Start TIM6 scheduler (1kHz)
     HAL_TIM_Base_Start_IT(&htim6);
+
+    // Start UART RX (IDLE-line DMA)
+    platform_uart_start_rx();
 
     platform_led_on();
 }

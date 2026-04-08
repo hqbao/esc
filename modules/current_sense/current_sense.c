@@ -68,7 +68,7 @@ static void on_adc_injected(uint8_t *data, size_t size) {
 
 static void on_notify_log_class(uint8_t *data, size_t size) {
     if (size < 1) return;
-    g_active_log_class = (data[0] == LOG_CLASS_CURRENT) ? LOG_CLASS_CURRENT : 0;
+    g_active_log_class = (data[0] == LOG_CLASS_RAW_CURRENT) ? LOG_CLASS_RAW_CURRENT : 0;
 }
 
 static void on_scheduler_25hz(uint8_t *data, size_t size) {
