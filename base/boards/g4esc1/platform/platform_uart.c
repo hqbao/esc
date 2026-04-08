@@ -1,4 +1,5 @@
 // USART2 driver for B-G431B-ESC1 (PB3 TX, PB4 RX)
+// TX: DMA (for efficient multi-byte sends from queue)
 // RX: IDLE-line DMA with circular buffer → publishes UART_RAW_RECEIVED
 
 #include "platform_hw.h"
@@ -12,11 +13,17 @@ static uint8_t g_rx_buf[UART_RX_BUF_SIZE];
 static volatile uint16_t g_last_pos = 0;
 
 char platform_uart_send(uart_port_t port, uint8_t *data, uint16_t size) {
-    (void)port; // only one UART
+    (void)port;
     if (HAL_UART_Transmit_DMA(&huart2, data, size) == HAL_OK) {
         return PLATFORM_OK;
     }
     return PLATFORM_ERROR;
+}
+
+// Called from HAL_UART_TxCpltCallback in platform_isr.c
+void platform_uart_tx_complete(void) {
+    uint8_t port = 0;
+    publish(UART_TX_COMPLETE, &port, sizeof(port));
 }
 
 void platform_uart_start_rx(void) {
@@ -31,7 +38,6 @@ void platform_uart_rx_event(uint16_t size) {
     if (size > start) {
         publish(UART_RAW_RECEIVED, &g_rx_buf[start], size - start);
     } else if (size < start) {
-        // Wrap-around
         publish(UART_RAW_RECEIVED, &g_rx_buf[start], UART_RX_BUF_SIZE - start);
         if (size > 0) {
             publish(UART_RAW_RECEIVED, &g_rx_buf[0], size);

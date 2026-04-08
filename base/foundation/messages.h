@@ -44,5 +44,17 @@ typedef struct {
 #define LOG_CLASS_RAW_CURRENT  4
 #define LOG_CLASS_ENCODER      5
 #define LOG_CLASS_OPENLOOP     6
+#define LOG_CLASS_STORAGE      7
+
+// Parameter IDs for local storage (4 bytes each)
+typedef enum {
+    PARAM_ID_ENC_OFFSET = 0,
+    PARAM_ID_COUNT = 8,   // max params (room for future PI gains etc)
+} param_id_e;
+
+typedef struct {
+    param_id_e id;
+    float value;
+} param_storage_t;
 
 #endif // MESSAGES_H

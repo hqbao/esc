@@ -37,6 +37,7 @@ VPATH += $(MODULES_DIR)/current_sense
 VPATH += $(MODULES_DIR)/voltage_monitor
 VPATH += $(MODULES_DIR)/encoder
 VPATH += $(MODULES_DIR)/dblink
+VPATH += $(MODULES_DIR)/local_storage
 
 # C sources — local (relative to board dir)
 C_SOURCES = \
@@ -52,6 +53,7 @@ platform/platform_pwm.c \
 platform/platform_isr.c \
 platform/platform_encoder.c \
 platform/platform_uart.c \
+platform/platform_storage.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc_ex.c \
@@ -86,7 +88,10 @@ foc.c \
 current_sense.c \
 voltage_monitor.c \
 encoder.c \
-dblink.c
+dblink.c \
+db_reader.c \
+db_sender.c \
+local_storage.c
 
 # ASM sources
 ASM_SOURCES = \

@@ -111,6 +111,7 @@ static float    g_i_alpha, g_i_beta;
 
 // Park outputs
 static float    g_id, g_iq;
+static float    g_theta;
 
 // FOC outputs
 static float    g_vd, g_vq;
@@ -266,9 +267,20 @@ static void on_commutate(uint8_t *data, size_t size) {
     clarke(g_iu, g_iv, g_iw, &g_i_alpha, &g_i_beta);
 
     // Calibrated rotor angle
-    float theta = g_enc_elec - g_enc_offset;
-    if (theta < 0.0f)    theta += TWO_PI;
-    if (theta >= TWO_PI) theta -= TWO_PI;
+    // Open-loop: use known voltage angle (encoder too noisy with 22 PP)
+    // Closed-loop: use encoder
+    float theta = 0.0f;
+    if (g_state == STATE_OPENLOOP || g_state == STATE_RAMP) {
+        theta = (float)(M_PI * 0.5) - g_ol_angle * (TWO_PI / (float)SINE_TABLE_SIZE);
+        if (theta < 0.0f)    theta += TWO_PI;
+        if (theta >= TWO_PI) theta -= TWO_PI;
+    } else {
+        theta = g_enc_elec - g_enc_offset;
+        if (theta < 0.0f)    theta += TWO_PI;
+        if (theta >= TWO_PI) theta -= TWO_PI;
+    }
+
+    g_theta = theta;
 
     // Always compute Park
     park(g_i_alpha, g_i_beta, theta, &g_id, &g_iq);
@@ -293,9 +305,16 @@ static void on_commutate(uint8_t *data, size_t size) {
             g_cal_cnt = 0;
             g_cal_avg_cnt = 0;
             if (g_cal_step >= CAL_STEPS) {
-                g_enc_offset = g_cal_enc[0];
+                // Same π/2 correction as ALIGN — sine table index 0
+                // drives the voltage vector to 90° in α-β space.
+                g_enc_offset = g_cal_enc[0] - (float)(M_PI * 0.5);
+                if (g_enc_offset < 0.0f) g_enc_offset += TWO_PI;
                 platform_pwm_stop();
                 g_state = STATE_IDLE;
+
+                // Save calibrated offset to flash
+                param_storage_t p = { .id = PARAM_ID_ENC_OFFSET, .value = g_enc_offset };
+                publish(LOCAL_STORAGE_SAVE, (uint8_t *)&p, sizeof(p));
             }
         }
         break;
@@ -303,6 +322,7 @@ static void on_commutate(uint8_t *data, size_t size) {
     case STATE_ALIGN:
         apply_openloop(0.0f, ALIGN_AMPLITUDE);
         if (++g_align_cnt >= ALIGN_TICKS) {
+            // Capture raw offset — correction angle determined empirically
             g_enc_offset = g_enc_elec;
             g_state = STATE_RAMP;
             g_ramp_cnt = 0;
@@ -412,17 +432,12 @@ static void on_scheduler_25hz(uint8_t *data, size_t size) {
 
     case LOG_CLASS_VOLTAGE:
         // CP4: Park currents
-        // [0] state  [1] Id  [2] Iq  [3] theta_rotor
+        // [0] state  [1] Id  [2] Iq  [3] theta (angle used in Park)
         // [4] enc_elec  [5] enc_offset  [6] Ia  [7] Ib
         log_data[0] = (float)g_state;
         log_data[1] = g_id;
         log_data[2] = g_iq;
-        {
-            float th = g_enc_elec - g_enc_offset;
-            if (th < 0.0f) th += TWO_PI;
-            if (th >= TWO_PI) th -= TWO_PI;
-            log_data[3] = th;
-        }
+        log_data[3] = g_theta;  // actual angle used in Park (OL or encoder)
         log_data[4] = g_enc_elec;
         log_data[5] = g_enc_offset;
         log_data[6] = g_i_alpha;
@@ -453,6 +468,17 @@ static void on_scheduler_25hz(uint8_t *data, size_t size) {
     }
 
     publish(SEND_LOG, (uint8_t *)log_data, sizeof(log_data));
+}
+
+// ── Storage result callback ────────────────────────────────────────────────
+
+static void on_storage_result(uint8_t *data, size_t size) {
+    if (size < sizeof(param_storage_t)) return;
+    param_storage_t p;
+    memcpy(&p, data, sizeof(p));
+    if (p.id == PARAM_ID_ENC_OFFSET && p.value != 0.0f) {
+        g_enc_offset = p.value;
+    }
 }
 
 // ── PWM enable/disable ─────────────────────────────────────────────────────
@@ -489,4 +515,9 @@ void foc_setup(void) {
     subscribe(SENSOR_ENCODER, on_encoder);
     subscribe(NOTIFY_LOG_CLASS, on_notify_log_class);
     subscribe(SCHEDULER_25HZ, on_scheduler_25hz);
+
+    // Load saved encoder offset from flash
+    subscribe(LOCAL_STORAGE_RESULT, on_storage_result);
+    param_id_e id = PARAM_ID_ENC_OFFSET;
+    publish(LOCAL_STORAGE_LOAD, (uint8_t *)&id, sizeof(id));
 }

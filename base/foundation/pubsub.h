@@ -28,6 +28,7 @@ typedef enum {
 
     // UART / CAN
     UART_RAW_RECEIVED,
+    UART_TX_COMPLETE,
     UART_RAW_SEND,
     CAN_MESSAGE_RECEIVED,
     CAN_MESSAGE_SEND,
@@ -35,6 +36,11 @@ typedef enum {
     // ADC
     ADC_INJECTED_COMPLETE,
     ADC_REGULAR_COMPLETE,
+
+    // Storage
+    LOCAL_STORAGE_SAVE,
+    LOCAL_STORAGE_LOAD,
+    LOCAL_STORAGE_RESULT,
 
     // System
     NOTIFY_LOG_CLASS,

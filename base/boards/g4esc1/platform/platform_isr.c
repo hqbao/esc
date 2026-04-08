@@ -69,14 +69,21 @@ void HAL_TIMEx_BreakCallback(TIM_HandleTypeDef *htim) {
     publish(FOC_RELEASE, NULL, 0);
 }
 
-// ── UART RX (IDLE line detection) ─────────────────────────────────────────
+// ── UART callbacks ────────────────────────────────────────────────────────
 // Declared in platform_uart.c
 extern void platform_uart_rx_event(uint16_t size);
 extern void platform_uart_rx_error(void);
+extern void platform_uart_tx_complete(void);
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
     if (huart->Instance == USART2) {
         platform_uart_rx_event(Size);
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        platform_uart_tx_complete();
     }
 }
 

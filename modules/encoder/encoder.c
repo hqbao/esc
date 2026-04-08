@@ -23,6 +23,7 @@
 #include <messages.h>
 #include <macro.h>
 #include <string.h>
+#include <math.h>
 
 // AS5048A constants
 #define AS5048A_CMD_ANGLE  0x3FFF   // Read angle register (0x3FFF with R bit)
@@ -34,6 +35,7 @@ static encoder_data_t g_encoder;
 static float g_prev_mech_angle = 0.0f;
 static float g_turns = 0.0f;
 static int   g_warmup = 5;         // skip first N reads for sensor settle
+static int   g_reject_count = 0;   // consecutive glitch rejections
 static uint8_t g_active_log_class = 0;
 
 // Parity: even parity over 15 lower bits, placed in bit 15
@@ -91,15 +93,26 @@ static uint16_t read_angle_raw(void) {
     uint16_t cmd = add_parity(0x4000 | AS5048A_CMD_ANGLE); // R=1, addr=0x3FFF
     spi_transfer16(cmd);                                     // send command
     uint16_t resp = spi_transfer16(add_parity(AS5048A_CMD_NOP)); // read response
+
+    // Bit 14 = error flag — reject corrupted reads
+    if (resp & 0x4000) return g_encoder.raw;  // keep previous
+
     return resp & 0x3FFF;  // 14-bit angle
 }
+
+// Max mechanical angle change per 1kHz tick at reasonable speed.
+// 5° mech/ms = 5000°/s = 13.9 rev/s = 833 RPM — well above open-loop range.
+// After 10 consecutive rejections (10ms), accept the reading — the motor
+// legitimately moved (e.g. ALIGN jerk) and prev must resync.
+#define MECH_GLITCH_THRESHOLD 5.0f
+#define MAX_REJECT 10
 
 // 1 kHz encoder read
 static void on_scheduler_1khz(uint8_t *data, size_t size) {
     uint16_t raw = read_angle_raw();
 
-    // Mechanical angle 0–360° (negated: encoder counts opposite to field direction)
-    float mech_angle = 360.0f - 360.0f * (float)raw / (float)AS5048A_COUNTS;
+    // Mechanical angle 0–360° (NOT negated — required for correct Park/FOC convention)
+    float mech_angle = 360.0f * (float)raw / (float)AS5048A_COUNTS;
     if (mech_angle >= 360.0f) mech_angle -= 360.0f;
 
     if (g_warmup > 0) {
@@ -108,16 +121,25 @@ static void on_scheduler_1khz(uint8_t *data, size_t size) {
         return;
     }
 
-    // Multi-turn tracking
+    // Glitch filter: reject if mechanical angle jumps too far in one tick
     float delta = mech_angle - g_prev_mech_angle;
-    if (delta < -180.0f) g_turns += 1.0f;
-    if (delta >  180.0f) g_turns -= 1.0f;
+    if (delta >  180.0f) delta -= 360.0f;
+    if (delta < -180.0f) delta += 360.0f;
+    if ((delta > MECH_GLITCH_THRESHOLD || delta < -MECH_GLITCH_THRESHOLD)
+        && g_reject_count < MAX_REJECT) {
+        g_reject_count++;
+        return;  // reject — keep previous encoder state
+    }
+
+    // Multi-turn tracking (use wrapped delta)
+    if (delta < -170.0f) g_turns += 1.0f;
+    if (delta >  170.0f) g_turns -= 1.0f;
+    g_reject_count = 0;
     g_prev_mech_angle = mech_angle;
 
     // Electrical angle = (mechanical angle × pole pairs) mod 360°
-    float elec_deg = mech_angle * (float)NUM_POLE_PAIRS;
-    while (elec_deg >= 360.0f) elec_deg -= 360.0f;
-    while (elec_deg < 0.0f)    elec_deg += 360.0f;
+    float elec_deg = fmodf(mech_angle * (float)NUM_POLE_PAIRS, 360.0f);
+    if (elec_deg < 0.0f) elec_deg += 360.0f;
 
     // Convert to radians for FOC
     float elec_rad = elec_deg * (M_PI / 180.0f);

@@ -46,6 +46,10 @@ void platform_delay_ms(uint32_t ms);
 uint32_t platform_get_tick_ms(void);
 void platform_reset(void);
 
+// Flash storage
+char platform_storage_read(uint16_t start, uint16_t size, uint8_t *data);
+char platform_storage_write(uint16_t start, uint16_t size, uint8_t *data);
+
 // Board init (called from main, calls all module _setup() functions)
 void platform_setup(void);
 

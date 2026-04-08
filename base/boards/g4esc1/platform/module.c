@@ -8,6 +8,7 @@
 #include <encoder/encoder.h>
 #include <foc/foc.h>
 #include <dblink/dblink.h>
+#include <local_storage/local_storage.h>
 
 // Start all analog hardware required before modules can run
 static void hw_init(void) {
@@ -37,6 +38,7 @@ void platform_setup(void) {
     hw_init();
 
     // Module setup — each subscribes to PubSub topics
+    local_storage_setup();
     current_sense_setup();
     voltage_monitor_setup();
     encoder_setup();
