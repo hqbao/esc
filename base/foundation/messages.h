@@ -45,6 +45,7 @@ typedef struct {
 #define LOG_CLASS_ENCODER      5
 #define LOG_CLASS_OPENLOOP     6
 #define LOG_CLASS_STORAGE      7
+#define LOG_CLASS_BEMF         8
 
 // Parameter IDs for local storage (4 bytes each)
 typedef enum {

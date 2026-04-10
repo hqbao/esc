@@ -1,6 +1,12 @@
 #!/bin/bash
 # Build script for B-G431B-ESC1
-# Usage: ./build.sh [clean]
+# Usage: ./build.sh [clean|encoder|no_feedback|bemf]
+#
+# FOC mode selection:
+#   ./build.sh              # default: encoder
+#   ./build.sh encoder      # closed-loop with AS5048A
+#   ./build.sh no_feedback  # open-loop only
+#   ./build.sh bemf         # sensorless (placeholder)
 
 set -e
 
@@ -21,23 +27,27 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${YELLOW}========================================${NC}"
-echo -e "${YELLOW}B-G431B-ESC1 — Build${NC}"
-echo -e "${YELLOW}========================================${NC}"
-
-# Clean if requested
+# Parse argument
+FOC_MODE="encoder"
 if [[ "$1" == "clean" ]]; then
     echo -e "${YELLOW}Cleaning build artifacts...${NC}"
     cd "$PROJECT_DIR"
     make clean
     echo -e "${GREEN}✓ Clean complete${NC}"
     exit 0
+elif [[ "$1" == "no_feedback" || "$1" == "encoder" || "$1" == "bemf" ]]; then
+    FOC_MODE="$1"
 fi
 
-# Build
-echo -e "${YELLOW}Building...${NC}"
+echo -e "${YELLOW}========================================${NC}"
+echo -e "${YELLOW}B-G431B-ESC1 — Build (FOC_MODE=$FOC_MODE)${NC}"
+echo -e "${YELLOW}========================================${NC}"
+
+# Clean + rebuild to avoid stale object from different mode
+echo -e "${YELLOW}Building ($FOC_MODE)...${NC}"
 cd "$PROJECT_DIR"
-make -j8 all
+make clean 2>/dev/null || true
+make -j8 all FOC_MODE=$FOC_MODE
 
 # Verify
 ELF="$BUILD_DIR/$TARGET.elf"

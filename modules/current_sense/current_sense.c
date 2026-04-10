@@ -55,12 +55,15 @@ static void on_adc_injected(uint8_t *data, size_t size) {
         return;
     }
 
-    // Convert to Amps: (ADC - offset) / 4096 * 3.3V / (0.003 * 16)
-    g_current.phase_u = ((float)raw_u - (float)g_offset_u) / (float)ADC_RESOLUTION
+    // Convert to Amps: (offset - ADC) / 4096 * 3.3V / (0.003 * 16)
+    // Sign: low-side shunts read positive when current flows OUT of the motor
+    // (drain→source→shunt→GND). FOC convention is positive = INTO motor,
+    // so we negate: (offset - raw) gives positive for sourcing phases.
+    g_current.phase_u = ((float)g_offset_u - (float)raw_u) / (float)ADC_RESOLUTION
                         * ADC_VREF / (SHUNT_RESISTANCE * OPAMP_GAIN);
-    g_current.phase_v = ((float)raw_v - (float)g_offset_v) / (float)ADC_RESOLUTION
+    g_current.phase_v = ((float)g_offset_v - (float)raw_v) / (float)ADC_RESOLUTION
                         * ADC_VREF / (SHUNT_RESISTANCE * OPAMP_GAIN);
-    g_current.phase_w = ((float)raw_w - (float)g_offset_w) / (float)ADC_RESOLUTION
+    g_current.phase_w = ((float)g_offset_w - (float)raw_w) / (float)ADC_RESOLUTION
                         * ADC_VREF / (SHUNT_RESISTANCE * OPAMP_GAIN);
 
     publish(SENSOR_PHASE_CURRENT, (uint8_t *)&g_current, sizeof(g_current));

@@ -28,4 +28,12 @@ static inline void inv_park(float d, float q, float theta,
     *beta  = d * st + q * ct;
 }
 
+// Inverse Clarke: orthogonal (alpha, beta) -> 3-phase (a, b, c)
+static inline void inv_clarke(float alpha, float beta,
+                               float *a, float *b, float *c) {
+    *a =  alpha;
+    *b = -0.5f * alpha + 0.86602540f * beta;
+    *c = -0.5f * alpha - 0.86602540f * beta;
+}
+
 #endif // FOC_MATH_H

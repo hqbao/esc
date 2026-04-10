@@ -17,6 +17,7 @@
 #define DB_CMD_LOG_CLASS  0x03
 #define DB_CMD_RESET      0x07
 
+
 typedef enum {
     SYNC1, SYNC2, CMD, CLASS, SIZE_LO, SIZE_HI, PAYLOAD, CK_LO, CK_HI
 } state_e;

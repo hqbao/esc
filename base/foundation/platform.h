@@ -8,21 +8,20 @@
 #define PLATFORM_ERROR -1
 
 typedef enum {
-    PWM_PHASE_U = 0,
-    PWM_PHASE_V,
-    PWM_PHASE_W,
-} pwm_phase_t;
+    PWM_PORT1 = 0,
+    PWM_PORT2,
+    PWM_PORT3,
+} pwm_port_t;
 
 typedef enum {
     UART_PORT1 = 0,
 } uart_port_t;
 
 // Motor PWM
-void platform_pwm_set_duty(pwm_phase_t phase, uint32_t duty);
+char platform_pwm_init(pwm_port_t port);
+char platform_pwm_send(pwm_port_t port, uint32_t data);
 void platform_pwm_start(void);
 void platform_pwm_stop(void);
-void platform_pwm_enable_phase(pwm_phase_t phase);
-void platform_pwm_disable_phase(pwm_phase_t phase);
 
 // Encoder (bit-bang SPI)
 void platform_encoder_init(void);

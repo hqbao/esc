@@ -8,7 +8,7 @@
 #define PWM_PERIOD         2125
 
 // Motor parameters (B-G431B-ESC1 reference design)
-#define NUM_POLE_PAIRS     22      // Measured: encoder rate = 0.5× current rate → 2× original count
+#define NUM_POLE_PAIRS     22      // Measured: 90° / 4.08° mech = 22.1 PP
 
 // Current sensing
 #define SHUNT_RESISTANCE   0.003f  // Ohms

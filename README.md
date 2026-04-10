@@ -3,6 +3,8 @@
 Field-Oriented Control (FOC) firmware for the **B-G431B-ESC1** discovery kit (STM32G431CBU6).
 Built from scratch with the same PubSub architecture as the [flight-controller](../flight-controller/) project.
 
+Three FOC modes selectable at build time: **encoder**, **BEMF sensorless**, and **no-feedback** (open-loop only).
+
 ## Hardware
 
 | Item | Detail |
@@ -28,13 +30,13 @@ esc/
 │   │       ├── platform/           # Board-specific drivers
 │   │       │   ├── module.c        # Module init + peripheral start
 │   │       │   ├── platform_isr.c  # ISR → PubSub bridge
-│   │       │   ├── platform_pwm.c  # PWM + DShot output
+│   │       │   ├── platform_pwm.c  # PWM output
 │   │       │   ├── platform_encoder.c  # AS5048A SPI bit-bang
 │   │       │   ├── platform_uart.c # UART DMA + IDLE detection
 │   │       │   ├── platform_common.c   # LED, delay, time, reset
 │   │       │   └── platform_hw.h   # Extern HAL handle declarations
 │   │       ├── Makefile            # Standalone ARM GCC build
-│   │       ├── build.sh            # Build script
+│   │       ├── build.sh            # Build script (accepts mode arg)
 │   │       └── build-flash.sh      # Build + ST-Link flash
 │   └── foundation/                 # Shared core
 │       ├── pubsub.h / pubsub.c    # Topic-based pub/sub
@@ -43,16 +45,22 @@ esc/
 │       ├── platform.h              # Platform abstraction API
 │       └── pi_controller.h        # Generic PI controller
 ├── modules/
+│   ├── config/          # Runtime configuration (motor params, PID gains)
 │   ├── current_sense/   # 3-phase shunt current → Amps
-│   ├── voltage_monitor/ # Bus voltage + temperature
+│   ├── dblink/          # UART protocol (DB framing) + commands
 │   ├── encoder/         # AS5048A → electrical/mechanical angle
-│   ├── foc/             # FOC state machine + transforms + PI loops
-│   └── dblink/          # UART protocol (DB framing) + commands
+│   ├── foc/             # FOC: encoder / BEMF / no-feedback modes
+│   ├── local_storage/   # Flash storage with CRC32 integrity
+│   └── voltage_monitor/ # Bus voltage + temperature
 │   Each module has its own README.md with data flow, PubSub interface, and configuration.
 ├── tools/                          # Python visualization & test tools
-│   ├── cp2_encoder_offset.py       # CP2: Encoder offset calibration
-│   ├── cp3_clarke_verify.py        # CP3: Clarke transform verification
-│   └── esc_foc_test.py             # General FOC diagnostic
+│   ├── foc_encoder_view.py         # Encoder CL: Id/Iq, Vq, offset, direction
+│   ├── foc_bemf_view.py            # BEMF CL: observer angle, flux, speed
+│   ├── foc_no_feedback_view.py     # Open-loop: angle/speed + encoder readback
+│   ├── debug_serial.py             # Raw serial monitor
+│   ├── debug_serial_custom.py      # Custom serial monitor
+│   ├── test_bemf_cl.py             # Automated BEMF single-throttle test
+│   └── test_bemf_multi.py          # Automated BEMF multi-throttle test (0.1/0.3/0.6)
 └── docs/
     ├── ADC_ALIGNMENT_BUG.md        # Left-aligned ADC data issue
     └── DMA_TX_CONTENTION_BUG.md    # DMA UART TX silent frame drops
@@ -96,42 +104,41 @@ subscribe(SENSOR_ENCODER, on_encoder_data);
 ```
 ADC injected ISR (TIM1_CC4)
   → current_sense: raw ADC → calibrated Amps → SENSOR_PHASE_CURRENT
-    → foc: Clarke → Park → PI (Id, Iq) → Inv Park → SVPWM → PWM duty
+    → foc: Clarke → Park → voltage-mode Vd/Vq → Inv Park → Inv Clarke → PWM duty
 ```
 
-### State Machine
+### FOC Modes
+
+| Mode | Build Command | Angle Source | Use Case |
+|------|--------------|-------------|----------|
+| Encoder | `bash build.sh encoder` | AS5048A encoder | Motors with encoder attached |
+| BEMF | `bash build.sh bemf` | Sensorless flux observer | Any BLDC motor |
+| No-feedback | `bash build.sh no_feedback` | Open-loop only | Testing / diagnostics |
+
+Only one mode compiles per build. `foc.h` defines `FOC_MODE_*` guards. Default is encoder if no mode specified.
+
+### State Machine (BEMF mode shown)
 
 | State | ID | Description |
 |-------|----|-------------|
 | IDLE | 0 | Waiting, PWM off |
-| CALIBRATE | 1 | Lock at 4 angles, measure encoder offset (CP2) |
-| ALIGN | 2 | Lock rotor, capture offset |
-| RAMP | 3 | Open-loop acceleration |
-| OPENLOOP | 4 | Steady open-loop (CP1/CP3/CP4) |
-| CLOSEDLOOP | 5 | Full FOC with PI current control (CP5/CP6) |
+| ALIGN | 1 | Lock rotor at 0° |
+| RAMP | 2 | Open-loop acceleration |
+| OPENLOOP | 3 | Steady OL, observer runs in background |
+| BLENDING | 4 | Gradual OL→CL angle/voltage blend (0.5s) |
+| CLOSEDLOOP | 5 | Full sensorless commutation |
 
 ### Log Classes
 
-| ID | Constant | Checkpoint | Payload |
-|----|----------|------------|---------|
-| 1 | `LOG_CLASS_FOC` | CP2 | state, cal_step, applied_angle, enc_elec, enc@0/90/180/270 |
-| 2 | `LOG_CLASS_CURRENT` | CP3 | state, Iα, Iβ, enc_elec, Vbus, 0, 0, 0 |
-| 3 | `LOG_CLASS_VOLTAGE` | CP4 | state, Id, Iq, theta_rotor, enc_elec, enc_offset, Iα, Iβ |
-| 4 | `LOG_CLASS_RAW_CURRENT` | — | Ia, Ib, Ic (raw phase currents, current_sense module) |
-| 5 | `LOG_CLASS_ENCODER` | CP5 | state, Id, Iq, Vd, Vq, Iq_ref, Id_ref, theta |
-
-## Checkpoint Verification
-
-Each subsystem is verified before moving to the next. Python tools visualize each checkpoint.
-
-| CP | Name | Tool | Status |
-|----|------|------|--------|
-| CP1 | Open-loop + encoder | `esc_foc_test.py` | ✅ Pass (11 pole pairs confirmed) |
-| CP2 | Encoder offset calibration | `cp2_encoder_offset.py` | ✅ Pass (84.0°, errors <5°) |
-| CP3 | Clarke transform | `cp3_clarke_verify.py` | 🔨 In progress |
-| CP4 | Park transform (Id/Iq DC) | — | Blocked by CP3 |
-| CP5 | Closed-loop current control | — | — |
-| CP6 | Speed control | — | — |
+| ID | Constant | Mode | Payload |
+|----|----------|------|---------|
+| 1 | `LOG_CLASS_FOC` | Encoder | enc_elec, enc_mech, theta, offset, ... |
+| 2 | `LOG_CLASS_CURRENT` | All | state, Iα, Iβ, enc_elec, Vbus, ... |
+| 3 | `LOG_CLASS_VOLTAGE` | BEMF/No-FB | state, Id, Iq, theta, bemf_theta, enc_elec, Iα, Iβ |
+| 4 | `LOG_CLASS_RAW_CURRENT` | — | Ia, Ib, Ic (raw phase currents) |
+| 5 | `LOG_CLASS_ENCODER` | Encoder | state, Id, Iq, Vq, enc_offset, enc_dir, ... |
+| 6 | `LOG_CLASS_OPENLOOP` | No-FB | OL angle, speed, encoder readback, ... |
+| 8 | `LOG_CLASS_BEMF` | BEMF | bemf_theta, ol_theta, enc_elec, flux_mag, speed, ... |
 
 ## Constants
 
@@ -139,15 +146,14 @@ Each subsystem is verified before moving to the next. Python tools visualize eac
 |----------|-------|-------------|
 | `PWM_FREQ` | 40 kHz | Center-aligned PWM frequency |
 | `PWM_PERIOD` | 2125 | Timer period (170 MHz / 2 / 40 kHz) |
-| `NUM_POLE_PAIRS` | 11 | Motor pole pairs |
 | `SHUNT_RESISTANCE` | 0.003 Ω | Current shunt value |
 | `OPAMP_GAIN` | 16.0 | Internal OPAMP PGA gain |
 | `ADC_VREF` | 3.3 V | ADC reference voltage |
 | `ADC_RESOLUTION` | 4096 | 12-bit ADC |
 | `VBUS_DIVIDER_RATIO` | 0.09626 | R1=169k, R2=18k |
 | `MOTOR_RESISTANCE` | 0.5 Ω | Phase resistance (tune per motor) |
-| `MOTOR_INDUCTANCE` | 1 mH | Phase inductance (tune per motor) |
-| `SINE_TABLE_SIZE` | 256 | Open-loop sine LUT |
+| `OBSERVER_R` | 0.05 | BEMF observer resistance (may differ from phase R) |
+| `OBSERVER_WC` | 20.0 | BEMF leaky integrator cutoff (rad/s) |
 
 ## ADC Architecture
 
@@ -159,8 +165,13 @@ Each subsystem is verified before moving to the next. Python tools visualize eac
 ## Building & Flashing
 
 ```bash
-# Build
+# Build (default: encoder mode)
 cd base/boards/g4esc1 && ./build.sh
+
+# Build specific mode
+cd base/boards/g4esc1 && bash build.sh encoder
+cd base/boards/g4esc1 && bash build.sh bemf
+cd base/boards/g4esc1 && bash build.sh no_feedback
 
 # Build + flash via ST-Link
 cd base/boards/g4esc1 && ./build-flash.sh
@@ -172,9 +183,12 @@ Deps: `pyserial matplotlib numpy`. Validate: `python3 -m py_compile <script>.py`
 
 | Tool | Purpose |
 |------|---------|
-| `cp2_encoder_offset.py` | CP2: Lock rotor at 4 angles, measure encoder offset |
-| `cp3_clarke_verify.py` | CP3: Verify Clarke Iα/Iβ sinusoids + Lissajous |
-| `esc_foc_test.py` | General FOC diagnostic (state, currents, encoder) |
+| `foc_encoder_view.py` | Encoder CL: Id/Iq, Vq, offset, direction |
+| `foc_bemf_view.py` | BEMF CL: observer angle, flux magnitude, speed |
+| `foc_no_feedback_view.py` | Open-loop: angle/speed + encoder readback |
+| `debug_serial.py` | Raw serial monitor |
+| `test_bemf_cl.py` | Automated BEMF single-throttle test |
+| `test_bemf_multi.py` | Automated BEMF multi-throttle test (0.1/0.3/0.6) |
 
 Each tool has **Start Log** / **Stop Motor** / **Reset FC** buttons and a throttle slider.
 

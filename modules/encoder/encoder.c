@@ -25,6 +25,10 @@
 #include <string.h>
 #include <math.h>
 
+// Inline interrupt control (CPSID/CPSIE) — avoids CMSIS header dependency
+#define DISABLE_IRQ() __asm volatile("cpsid i" ::: "memory")
+#define ENABLE_IRQ()  __asm volatile("cpsie i" ::: "memory")
+
 // AS5048A constants
 #define AS5048A_CMD_ANGLE  0x3FFF   // Read angle register (0x3FFF with R bit)
 #define AS5048A_CMD_NOP    0xC000   // NOP command (to clock out previous response)
@@ -87,15 +91,42 @@ static uint16_t spi_transfer16(uint16_t tx) {
     return rx;
 }
 
+// Clear the AS5048A error register (0x0001) — must be done after power-on
+// to reset the sticky error flag that latches during magnetic field settling.
+// Disables interrupts to protect bit-bang SPI from 40kHz ADC preemption.
+static void clear_error_register(void) {
+    uint16_t cmd = add_parity(0x4001);  // R=1, addr=0x0001 (clear error)
+    DISABLE_IRQ();
+    spi_transfer16(cmd);                // send command
+    spi_transfer16(add_parity(AS5048A_CMD_NOP)); // clock out response (discarded)
+    ENABLE_IRQ();
+}
+
 // Read 14-bit angle from AS5048A
 // Two SPI transactions: first sends command, second clocks out response
+// Disables interrupts to protect bit-bang SPI from 40kHz ADC preemption
+// (ADC1_2 priority 2 preempts TIM6 priority 3, corrupting GPIO timing).
+// Retries up to 3 times if response is 0x0000 (indicates corrupted transfer).
 static uint16_t read_angle_raw(void) {
     uint16_t cmd = add_parity(0x4000 | AS5048A_CMD_ANGLE); // R=1, addr=0x3FFF
-    spi_transfer16(cmd);                                     // send command
-    uint16_t resp = spi_transfer16(add_parity(AS5048A_CMD_NOP)); // read response
+    uint16_t nop = add_parity(AS5048A_CMD_NOP);
+    uint16_t resp;
 
-    // Bit 14 = error flag — reject corrupted reads
-    if (resp & 0x4000) return g_encoder.raw;  // keep previous
+    for (int retry = 0; retry < 3; retry++) {
+        DISABLE_IRQ();
+        spi_transfer16(cmd);
+        resp = spi_transfer16(nop);
+        ENABLE_IRQ();
+
+        if ((resp & 0x3FFF) != 0) break;  // got a non-zero angle, done
+
+        // Brief delay before retry (~2µs)
+        for (volatile int d = 0; d < 50; d++) {}
+    }
+
+    // Bit 14 = error flag. The angle data in bits [13:0] is still valid,
+    // so always use it. Clear the sticky error flag periodically.
+    if (resp & 0x4000) clear_error_register();
 
     return resp & 0x3FFF;  // 14-bit angle
 }
@@ -104,12 +135,15 @@ static uint16_t read_angle_raw(void) {
 // 5° mech/ms = 5000°/s = 13.9 rev/s = 833 RPM — well above open-loop range.
 // After 10 consecutive rejections (10ms), accept the reading — the motor
 // legitimately moved (e.g. ALIGN jerk) and prev must resync.
-#define MECH_GLITCH_THRESHOLD 5.0f
+#define MECH_GLITCH_THRESHOLD 160.0f
 #define MAX_REJECT 10
 
 // 1 kHz encoder read
 static void on_scheduler_1khz(uint8_t *data, size_t size) {
     uint16_t raw = read_angle_raw();
+    
+    // Ignore exactly 0 which usually occurs due to SPI MISO blackout / no response
+    if (raw == 0) return;
 
     // Mechanical angle 0–360° (NOT negated — required for correct Park/FOC convention)
     float mech_angle = 360.0f * (float)raw / (float)AS5048A_COUNTS;
@@ -173,6 +207,12 @@ static void on_scheduler_25hz(uint8_t *data, size_t size) {
 // Setup
 void encoder_setup(void) {
     platform_encoder_init();
+
+    // AS5048A needs ~10ms after power-on. Clear any latched startup errors.
+    for (int i = 0; i < 3; i++) {
+        clear_error_register();
+        for (volatile int d = 0; d < 5000; d++) {}  // ~30µs delay
+    }
 
     subscribe(SCHEDULER_1KHZ, on_scheduler_1khz);
     subscribe(NOTIFY_LOG_CLASS, on_notify_log_class);

@@ -38,6 +38,7 @@ VPATH += $(MODULES_DIR)/voltage_monitor
 VPATH += $(MODULES_DIR)/encoder
 VPATH += $(MODULES_DIR)/dblink
 VPATH += $(MODULES_DIR)/local_storage
+VPATH += $(MODULES_DIR)/config
 
 # C sources — local (relative to board dir)
 C_SOURCES = \
@@ -81,17 +82,23 @@ Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_tim_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart_ex.c
 
+# FOC mode selection: no_feedback, encoder, bemf
+FOC_MODE ?= encoder
+FOC_MODE_UPPER := $(shell echo $(FOC_MODE) | tr 'a-z' 'A-Z')
+
 # Out-of-tree sources (found via VPATH)
 EXT_SOURCES = \
 pubsub.c \
 foc.c \
+foc_$(FOC_MODE).c \
 current_sense.c \
 voltage_monitor.c \
 encoder.c \
 dblink.c \
 db_reader.c \
 db_sender.c \
-local_storage.c
+local_storage.c \
+config.c
 
 # ASM sources
 ASM_SOURCES = \
@@ -117,7 +124,8 @@ C_INCLUDES = \
 
 C_DEFS = \
 -DUSE_HAL_DRIVER \
--DSTM32G431xx
+-DSTM32G431xx \
+-DFOC_MODE_$(FOC_MODE_UPPER)
 
 ASFLAGS = $(MCU) -Wall -fdata-sections -ffunction-sections
 

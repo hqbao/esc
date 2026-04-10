@@ -1,9 +1,9 @@
 #!/bin/bash
 # Build, flash, and optionally debug B-G431B-ESC1
 # Usage:
-#   ./build-flash.sh              # Build and flash
-#   ./build-flash.sh --verify     # Build, flash, and verify
-#   ./build-flash.sh --debug      # Build, flash, and debug with GDB
+#   ./build-flash.sh [mode]              # Build and flash (mode: encoder|no_feedback|bemf)
+#   ./build-flash.sh [mode] --verify     # Build, flash, and verify
+#   ./build-flash.sh [mode] --debug      # Build, flash, and debug with GDB
 
 set -e
 
@@ -20,23 +20,25 @@ NC='\033[0m'
 
 VERIFY=false
 DEBUG=false
+FOC_MODE="encoder"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --verify) VERIFY=true; shift ;;
         --debug) DEBUG=true; shift ;;
+        no_feedback|encoder|bemf) FOC_MODE="$1"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 echo -e "${YELLOW}========================================${NC}"
-echo -e "${YELLOW}B-G431B-ESC1 — Build & Flash${NC}"
+echo -e "${YELLOW}B-G431B-ESC1 — Build & Flash (FOC_MODE=$FOC_MODE)${NC}"
 echo -e "${YELLOW}========================================${NC}"
 echo ""
 
 # Step 1: Build
-echo -e "${YELLOW}[1/2] Building...${NC}"
-"$PROJECT_DIR/build.sh"
+echo -e "${YELLOW}[1/2] Building ($FOC_MODE)...${NC}"
+"$PROJECT_DIR/build.sh" "$FOC_MODE"
 echo ""
 
 # Step 2: Flash

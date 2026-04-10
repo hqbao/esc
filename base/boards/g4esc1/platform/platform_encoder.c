@@ -24,6 +24,14 @@ void platform_encoder_init(void) {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
+    // Disable TIM2 — CubeMX configures PA15 as TIM2_CH1 (PWM input capture).
+    // We reuse PA15 as encoder CS. Fully disable TIM2 to prevent any
+    // interference with GPIO output on PA15.
+    TIM2->CR1 = 0;              // stop counter
+    TIM2->DIER = 0;             // disable all TIM2 interrupts
+    TIM2->SR = 0;               // clear all pending flags
+    NVIC_DisableIRQ(TIM2_IRQn); // disable NVIC vector
+
     GPIO_InitTypeDef gpio = {0};
 
     // SCK — push-pull output, fast
