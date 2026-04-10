@@ -167,10 +167,11 @@ def main():
 
     # ── Panel 6: Status ──
     ax_status.set_xlim(0, 1); ax_status.set_ylim(0, 1); ax_status.axis('off')
-    status_text = ax_status.text(0.5, 0.75, 'IDLE', fontsize=16, ha='center',
+    status_text = ax_status.text(0.5, 0.85, 'IDLE', fontsize=16, ha='center',
                                   va='center', fontweight='bold', color='#888')
-    mode_text = ax_status.text(0.5, 0.55, '', fontsize=11, ha='center', va='center', color='#5af')
-    info_text = ax_status.text(0.5, 0.35, '', fontsize=9, ha='center', va='center', color=DIM)
+    mode_text = ax_status.text(0.5, 0.70, '', fontsize=11, ha='center', va='center', color='#5af')
+    rpm_text = ax_status.text(0.5, 0.50, '0 RPM', fontsize=22, ha='center', va='center', color='#5f5', fontweight='bold')
+    info_text = ax_status.text(0.5, 0.30, '', fontsize=9, ha='center', va='center', color=DIM)
     bemf_text = ax_status.text(0.5, 0.15, '', fontsize=9, ha='center', va='center', color=DIM)
 
     h = {k: np.zeros(HISTORY) for k in [
@@ -342,6 +343,8 @@ def main():
 
         # Panel 6: Status
         mode_text.set_text(m if m != 'none' else '')
+        rpm_val = h["bemf_speed"][-1] * 60.0 / (2.0 * math.pi * 7.0)  # assume 7 pole pairs
+        rpm_text.set_text(f'{rpm_val:.0f} RPM')
         info_text.set_text(f'Id={h["id"][-1]:+.3f}  Iq={h["iq"][-1]:+.3f}  '
                            f'\u03b8={h["theta"][-1]:.0f}\u00b0  Vbus={h["vbus"][-1]:.1f}V')
         bemf_text.set_text(f'BEMF\u03b8={h["bemf_theta"][-1]:.0f}\u00b0  '

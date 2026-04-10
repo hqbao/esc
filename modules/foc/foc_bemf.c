@@ -50,23 +50,43 @@ typedef enum {
 
 #define MAX_DUTY        ((float)PWM_PERIOD * 0.45f)
 
-#define OL_SPEED        0.03f
-#define OL_AMPLITUDE    (0.10f * MAX_DUTY)
+#define OL_SPEED        0.15f               // Max OL speed (23.4 Hz electrical)
+#define OL_AMPLITUDE    (0.15f * MAX_DUTY)  // Strong enough to kick it
 
-#define ALIGN_TICKS     20000
-#define ALIGN_AMPLITUDE (0.10f * MAX_DUTY)
-#define RAMP_MIN_TICKS  4000
-#define RAMP_SPEED_INIT 0.002f
-#define RAMP_SPEED_INC  0.000002f
-#define RAMP_AMP_INIT   (0.10f * MAX_DUTY)
+#define ALIGN_TICKS     4000                // 100 ms align
+#define ALIGN_AMPLITUDE (0.15f * MAX_DUTY)
+#define RAMP_MIN_TICKS  2000                // minimum 50 ms in ramp
+#define RAMP_SPEED_INIT 0.01f
+#define RAMP_SPEED_INC  0.00005f            // reaches max in ~70 ms
+#define RAMP_AMP_INIT   (0.15f * MAX_DUTY)
+
+// Current limiter (voltage-mode with Iq clamp)
+#define V_MAX_SCALAR    0.577f              // 1/sqrt(3) max inverter voltage scalar
+#define VQ_RAMP_RATE    0.001f              // ~40 V/s ramp response at 40kHz
+#define IQ_LIMIT        3.0f                // Max Iq before Vq reduction (amps)
+#define IQ_LIMIT_GAIN   0.5f                // Vq reduction per excess amp
+#define VQ_MIN          (0.15f * MAX_DUTY * 12.0f / PWM_PERIOD) // Min Vq to sustain BEMF (0.81V)
 
 // Observer tuning
 #define DT_S            (1.0f / 40000.0f)   // 25 µs per commutation tick
 #define OBSERVER_R      0.05f               // Observer resistance (low for high-KV tolerance)
 #define OBSERVER_WC     20.0f               // Leaky integrator cutoff (rad/s)
 #define BEMF_MAG_THRESH 0.005f              // Flux magnitude to allow blend start
-#define OL_HOLDOFF_TICKS 40000              // 1 s in OL before blend starts
-#define BLEND_TICKS      20000              // 0.5 s blend duration (OL→CL)
+#define BEMF_SPEED_LPF  0.005f              // Speed low-pass filter coefficient
+#define OBS_MIN_SPEED   1.0f                // Min rad/s to apply phase lead comp
+#define TIMING_ADVANCE  0.00003f            // Phase advance per rad/s (~30us)
+#define TIMING_ADV_MAX  0.26f               // Cap timing advance to ~15 degrees
+#define OL_HOLDOFF_TICKS 2000               // 50 ms steady OL holdoff
+#define BLEND_TICKS      4000               // 100 ms blend duration (OL→CL)
+
+// PWM & General control
+#define DUTY_MAX_CLAMP  0.95f               // 95% max PWM
+#define DUTY_MIN_CLAMP  0.05f               // 5% min PWM (bootstrap cap charge)
+#define TIMING_OFFSET   0.5f                // SVPWM zero-sequence modulation center
+#define THROTTLE_START  0.01f               // Throttle deadband
+#define OL_SPEED_LPF    0.001f              // Open-loop speed transition smoothing
+
+#define WRAP_ANGLE(val, max_val) do { while((val) >= (max_val)) (val) -= (max_val); while((val) < 0.0f) (val) += (max_val); } while(0)
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -116,6 +136,28 @@ static float    g_v_alpha, g_v_beta;
 // Duty cycles
 static float    g_duty_a, g_duty_b, g_duty_c;
 
+// ── Reset Helper ───────────────────────────────────────────────────────────
+
+static void reset_foc_state(void) {
+    g_state     = STATE_IDLE;
+    g_ol_angle  = 0.0f;
+    g_ol_speed  = 0.0f;
+    g_ol_speed_smooth = 0.0f;
+    g_amplitude = 0.0f;
+    g_align_cnt = 0;
+    g_ramp_cnt  = 0;
+    g_ol_cnt    = 0;
+    g_cl_vq     = 0.0f;
+    g_flux_alpha = 0.0f;
+    g_flux_beta  = 0.0f;
+    g_bemf_theta = 0.0f;
+    g_bemf_theta_prev = 0.0f;
+    g_bemf_speed = 0.0f;
+    g_bemf_mag   = 0.0f;
+    g_blend      = 0.0f;
+    g_blend_cnt  = 0;
+}
+
 // ── PWM helpers ────────────────────────────────────────────────────────────
 
 static void apply_svpwm(float va, float vb, float vc) {
@@ -124,17 +166,17 @@ static void apply_svpwm(float va, float vb, float vc) {
     if (vb > vmax) vmax = vb;
     if (vc < vmin) vmin = vc;
     if (vc > vmax) vmax = vc;
-    float voff = -(vmin + vmax) * 0.5f;
+    float voff = -(vmin + vmax) * TIMING_OFFSET;
     va += voff;  vb += voff;  vc += voff;
 
     float scale = (float)PWM_PERIOD / g_vbus;
-    float half  = (float)PWM_PERIOD * 0.5f;
+    float half  = (float)PWM_PERIOD * TIMING_OFFSET;
     g_duty_a = half + va * scale;
     g_duty_b = half + vb * scale;
     g_duty_c = half + vc * scale;
 
-    float max_d = (float)PWM_PERIOD * 0.95f;
-    float min_d = (float)PWM_PERIOD * 0.05f;
+    float max_d = (float)PWM_PERIOD * DUTY_MAX_CLAMP;
+    float min_d = (float)PWM_PERIOD * DUTY_MIN_CLAMP;
     g_duty_a = LIMIT(g_duty_a, min_d, max_d);
     g_duty_b = LIMIT(g_duty_b, min_d, max_d);
     g_duty_c = LIMIT(g_duty_c, min_d, max_d);
@@ -146,8 +188,7 @@ static void apply_svpwm(float va, float vb, float vc) {
 
 static inline float ol_theta_from_angle(float ol_angle) {
     float theta = ol_angle * (TWO_PI / (float)SINE_TABLE_SIZE);
-    while (theta >= TWO_PI) theta -= TWO_PI;
-    while (theta < 0.0f)    theta += TWO_PI;
+    WRAP_ANGLE(theta, TWO_PI);
     return theta;
 }
 
@@ -188,17 +229,17 @@ static void observer_update(void) {
     if (dtheta >  (float)M_PI) dtheta -= TWO_PI;
     if (dtheta < -(float)M_PI) dtheta += TWO_PI;
     float speed_raw = dtheta / DT_S;
-    g_bemf_speed += 0.005f * (speed_raw - g_bemf_speed);
+    g_bemf_speed += BEMF_SPEED_LPF * (speed_raw - g_bemf_speed);
 
     g_bemf_theta_prev = theta_est;
     g_bemf_theta = theta_est;
 
     // Compensate observer phase lead AND add timing advance for RL lag/software delay
     float abs_spd = fabsf(g_bemf_speed);
-    if (abs_spd > 1.0f) {
+    if (abs_spd > OBS_MIN_SPEED) {
         float phase_lead = atanf(OBSERVER_WC / abs_spd);
-        float timing_advance = abs_spd * 0.00003f;  // ~30us phase advance
-        if (timing_advance > 0.26f) timing_advance = 0.26f;  // cap at ~15°
+        float timing_advance = abs_spd * TIMING_ADVANCE;
+        if (timing_advance > TIMING_ADV_MAX) timing_advance = TIMING_ADV_MAX;
         
         float correction = phase_lead - timing_advance;
         if (g_bemf_speed > 0.0f)
@@ -206,8 +247,7 @@ static void observer_update(void) {
         else
             g_bemf_theta += correction;
             
-        if (g_bemf_theta < 0.0f)    g_bemf_theta += TWO_PI;
-        if (g_bemf_theta >= TWO_PI) g_bemf_theta -= TWO_PI;
+        WRAP_ANGLE(g_bemf_theta, TWO_PI);
     }
 
     // Flux magnitude (transition criterion)
@@ -238,31 +278,16 @@ static void on_motor_throttle(uint8_t *data, size_t size) {
     memcpy(&cmd, data, sizeof(cmd));
     g_throttle = LIMIT(cmd.throttle, 0.0f, 1.0f);
 
-    if (g_throttle < 0.01f && g_state != STATE_IDLE) {
+    if (g_throttle < THROTTLE_START && g_state != STATE_IDLE) {
         platform_pwm_stop();
-        g_state = STATE_IDLE;
-        g_ol_angle  = 0.0f;
-        g_ol_speed  = 0.0f;
-        g_ol_speed_smooth = 0.0f;
-        g_amplitude = 0.0f;
-        g_cl_vq     = 0.0f;
-        g_ol_cnt    = 0;
+        reset_foc_state();
     }
-    else if (g_throttle > 0.01f && g_state == STATE_IDLE) {
+    else if (g_throttle > THROTTLE_START && g_state == STATE_IDLE) {
+        reset_foc_state();
         g_state     = STATE_ALIGN;
-        g_align_cnt = 0;
-        g_ramp_cnt  = 0;
-        g_ol_cnt    = 0;
-        g_ol_angle  = 0.0f;
         g_ol_speed  = RAMP_SPEED_INIT;
         g_ol_speed_smooth = OL_SPEED;
         g_amplitude = RAMP_AMP_INIT;
-        g_flux_alpha = 0.0f;
-        g_flux_beta  = 0.0f;
-        g_bemf_theta = 0.0f;
-        g_bemf_theta_prev = 0.0f;
-        g_bemf_speed = 0.0f;
-        g_bemf_mag   = 0.0f;
         platform_pwm_start();
     }
 }
@@ -272,27 +297,38 @@ static void on_notify_log_class(uint8_t *data, size_t size) {
     g_log_class = data[0];
 }
 
-// ── CL commutation (voltage-mode, same approach as encoder CL) ─────────
+// ── CL commutation (voltage-mode + Iq current limiter) ─────────────────
 
 static void cl_commutate(float theta) {
-    float v_max = g_vbus * 0.577f;
+    float v_max = g_vbus * V_MAX_SCALAR;
     float vq_target = g_throttle * v_max;
-    if (vq_target > v_max) vq_target = v_max;
+    if (vq_target < VQ_MIN) vq_target = VQ_MIN;   // Prevent stall at low throttle
+    if (vq_target > v_max)  vq_target = v_max;
 
-    float ramp_rate = 0.00002f;
     if (g_cl_vq < vq_target) {
-        g_cl_vq += ramp_rate;
+        g_cl_vq += VQ_RAMP_RATE;
         if (g_cl_vq > vq_target) g_cl_vq = vq_target;
     } else if (g_cl_vq > vq_target) {
-        g_cl_vq -= ramp_rate;
+        g_cl_vq -= VQ_RAMP_RATE;
         if (g_cl_vq < vq_target) g_cl_vq = vq_target;
     }
 
-    g_vd = 0.0f;
-    g_vq = g_cl_vq;
+    // Current limiter: active limit for BOTH motoring (positive Iq) and braking (negative Iq)
+    float vq_out = g_cl_vq;
+    if (g_iq > IQ_LIMIT) {
+        // Motoring too hard -> reduce voltage to lower current
+        vq_out -= (g_iq - IQ_LIMIT) * IQ_LIMIT_GAIN;
+        if (vq_out < 0.0f) vq_out = 0.0f;
+    } else if (g_iq < -IQ_LIMIT) {
+        // Braking too hard -> INCREASE voltage to catch up to BEMF and prevent stall/desync
+        vq_out += (-g_iq - IQ_LIMIT) * IQ_LIMIT_GAIN;
+    }
 
+    g_vd = 0.0f;
+    g_vq = vq_out;
+
+    if (g_vq > v_max)  g_vq = v_max;
     if (g_vq < -v_max) g_vq = -v_max;
-    if (g_vq >  v_max) g_vq =  v_max;
 
     inv_park(g_vd, g_vq, theta, &g_v_alpha, &g_v_beta);
     float va, vb, vc;
@@ -328,8 +364,7 @@ static void on_commutate(uint8_t *data, size_t size) {
         if (diff >  (float)M_PI) diff -= TWO_PI;
         if (diff < -(float)M_PI) diff += TWO_PI;
         theta = ol_theta + g_blend * diff;
-        if (theta < 0.0f)    theta += TWO_PI;
-        if (theta >= TWO_PI) theta -= TWO_PI;
+        WRAP_ANGLE(theta, TWO_PI);
     } else {
         theta = g_bemf_theta;
     }
@@ -347,70 +382,54 @@ static void on_commutate(uint8_t *data, size_t size) {
         break;
 
     case STATE_RAMP:
-        g_ol_angle += g_ol_speed;
-        if (g_ol_angle >= (float)SINE_TABLE_SIZE)
-            g_ol_angle -= (float)SINE_TABLE_SIZE;
-
+    case STATE_OPENLOOP:
+    case STATE_BLENDING: {
         g_ol_speed += RAMP_SPEED_INC;
         if (g_ol_speed > OL_SPEED) g_ol_speed = OL_SPEED;
 
-        apply_openloop(g_ol_angle, g_amplitude);
-
-        if (++g_ramp_cnt > RAMP_MIN_TICKS && g_ol_speed >= OL_SPEED) {
-            g_state  = STATE_OPENLOOP;
-            g_ol_cnt = 0;
-        }
-        break;
-
-    case STATE_OPENLOOP: {
-        g_ol_speed_smooth += (OL_SPEED - g_ol_speed_smooth) * 0.001f;
+        g_ol_speed_smooth += (OL_SPEED - g_ol_speed_smooth) * OL_SPEED_LPF;
         g_amplitude = OL_AMPLITUDE + g_throttle * (MAX_DUTY - OL_AMPLITUDE);
-        g_ol_angle += g_ol_speed_smooth;
-        if (g_ol_angle >= (float)SINE_TABLE_SIZE)
-            g_ol_angle -= (float)SINE_TABLE_SIZE;
-        apply_openloop(g_ol_angle, g_amplitude);
+        
+        g_ol_angle += (g_state == STATE_RAMP) ? g_ol_speed : g_ol_speed_smooth;
+        WRAP_ANGLE(g_ol_angle, (float)SINE_TABLE_SIZE);
 
-        g_ol_cnt++;
-
-        // Start blended transition when observer has settled
-        if (g_ol_cnt > OL_HOLDOFF_TICKS && g_bemf_mag > BEMF_MAG_THRESH) {
-            g_blend     = 0.0f;
-            g_blend_cnt = 0;
-            g_state     = STATE_BLENDING;
+        if (g_state == STATE_RAMP) {
+            apply_openloop(g_ol_angle, g_amplitude);
+            if (++g_ramp_cnt > RAMP_MIN_TICKS && g_ol_speed >= OL_SPEED) {
+                g_state  = STATE_OPENLOOP;
+                g_ol_cnt = 0;
+            }
+        } 
+        else if (g_state == STATE_OPENLOOP) {
+            apply_openloop(g_ol_angle, g_amplitude);
+            if (++g_ol_cnt > OL_HOLDOFF_TICKS && g_bemf_mag > BEMF_MAG_THRESH) {
+                g_state     = STATE_BLENDING;
+                g_blend     = 0.0f;
+                g_blend_cnt = 0;
+            }
         }
-        break;
-    }
+        else if (g_state == STATE_BLENDING) {
+            // Ramp blend 0→1
+            g_blend = (float)(++g_blend_cnt) / (float)BLEND_TICKS;
+            if (g_blend >= 1.0f) g_blend = 1.0f;
 
-    case STATE_BLENDING: {
-        // Keep advancing OL angle at fixed speed
-        g_ol_speed_smooth += (OL_SPEED - g_ol_speed_smooth) * 0.001f;
-        g_amplitude = OL_AMPLITUDE + g_throttle * (MAX_DUTY - OL_AMPLITUDE);
-        g_ol_angle += g_ol_speed_smooth;
-        if (g_ol_angle >= (float)SINE_TABLE_SIZE)
-            g_ol_angle -= (float)SINE_TABLE_SIZE;
+            float vd_ol = g_amplitude * g_vbus / (float)PWM_PERIOD;
+            float v_max = g_vbus * V_MAX_SCALAR;
+            float vq_target = g_throttle * v_max;
+            if (vq_target < VQ_MIN) vq_target = VQ_MIN;
 
-        // Ramp blend 0→1
-        g_blend_cnt++;
-        g_blend = (float)g_blend_cnt / (float)BLEND_TICKS;
-        if (g_blend >= 1.0f) g_blend = 1.0f;
+            g_vd = (1.0f - g_blend) * vd_ol;
+            g_vq = g_blend * vq_target;
 
-        // Gradual Vd→Vq blend (prevents observer flux collapse)
-        float vd_ol = g_amplitude * g_vbus / (float)PWM_PERIOD;
-        float v_max = g_vbus * 0.577f;
-        float vq_target = g_throttle * v_max;
-        if (vq_target > v_max) vq_target = v_max;
+            inv_park(g_vd, g_vq, theta, &g_v_alpha, &g_v_beta);
+            float va, vb, vc;
+            inv_clarke(g_v_alpha, g_v_beta, &va, &vb, &vc);
+            apply_svpwm(va, vb, vc);
 
-        g_vd = (1.0f - g_blend) * vd_ol;
-        g_vq = g_blend * vq_target;
-
-        inv_park(g_vd, g_vq, theta, &g_v_alpha, &g_v_beta);
-        float va, vb, vc;
-        inv_clarke(g_v_alpha, g_v_beta, &va, &vb, &vc);
-        apply_svpwm(va, vb, vc);
-
-        if (g_blend >= 1.0f) { 
-            g_cl_vq = vq_target;
-            g_state = STATE_CLOSEDLOOP;
+            if (g_blend >= 1.0f) {
+                g_cl_vq = g_vq;
+                g_state = STATE_CLOSEDLOOP;
+            }
         }
         break;
     }
@@ -434,15 +453,15 @@ static void on_scheduler_25hz(uint8_t *data, size_t size) {
 
     switch (g_log_class) {
     case LOG_CLASS_VOLTAGE:
-        // [0]state [1]Id [2]Iq [3]theta [4]bemf_theta [5]enc_elec [6]Ia [7]Ib
+        // [0]state [1]Id [2]Iq [3]Vd [4]Vq [5]Iq_limit [6]theta [7]bemf_theta
         log_data[0] = (float)g_state;
         log_data[1] = g_id;
         log_data[2] = g_iq;
-        log_data[3] = g_theta;
-        log_data[4] = g_bemf_theta;
-        log_data[5] = g_enc_elec;
-        log_data[6] = g_i_alpha;
-        log_data[7] = g_i_beta;
+        log_data[3] = g_vd;
+        log_data[4] = g_vq;
+        log_data[5] = IQ_LIMIT;
+        log_data[6] = g_theta;
+        log_data[7] = g_bemf_theta;
         ok = 1;
         break;
 
