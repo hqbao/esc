@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --verify) VERIFY=true; shift ;;
         --debug) DEBUG=true; shift ;;
-        no_feedback|encoder|bemf) FOC_MODE="$1"; shift ;;
+        no_feedback|encoder|bemf|6step) FOC_MODE="$1"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done

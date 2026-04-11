@@ -14,17 +14,10 @@ typedef enum {
 
     // Sensor events
     SENSOR_BUS_VOLTAGE,
-    SENSOR_PHASE_CURRENT,
-    SENSOR_TEMPERATURE,
 
     // Motor control
-    FOC_SETUP,
-    FOC_COMMUTATE,
     FOC_RELEASE,
     MOTOR_THROTTLE,
-
-    // Encoder
-    SENSOR_ENCODER,
 
     // UART / CAN
     UART_RAW_RECEIVED,
@@ -36,11 +29,6 @@ typedef enum {
     // ADC
     ADC_INJECTED_COMPLETE,
     ADC_REGULAR_COMPLETE,
-
-    // Storage
-    LOCAL_STORAGE_SAVE,
-    LOCAL_STORAGE_LOAD,
-    LOCAL_STORAGE_RESULT,
 
     // System
     NOTIFY_LOG_CLASS,

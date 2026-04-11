@@ -39,7 +39,7 @@ ADC_REGULAR_COMPLETE (100 Hz, software-polled in ISR)
 | Topic | Rate | Purpose |
 |-------|------|---------|
 | `ADC_REGULAR_COMPLETE` | 100 Hz | Raw VBUS ADC value from ISR |
-| `NOTIFY_LOG_CLASS` | Event | Activate `LOG_CLASS_VOLTAGE` (3) logging |
+| `NOTIFY_LOG_CLASS` | Event | Activate `LOG_CLASS_VOLTAGE` (4) logging |
 | `SCHEDULER_25HZ` | 25 Hz | Publish voltage log |
 
 ### Publications

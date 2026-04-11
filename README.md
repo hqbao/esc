@@ -54,13 +54,7 @@ esc/
 │   └── voltage_monitor/ # Bus voltage + temperature
 │   Each module has its own README.md with data flow, PubSub interface, and configuration.
 ├── tools/                          # Python visualization & test tools
-│   ├── foc_encoder_view.py         # Encoder CL: Id/Iq, Vq, offset, direction
-│   ├── foc_bemf_view.py            # BEMF CL: observer angle, flux, speed
-│   ├── foc_no_feedback_view.py     # Open-loop: angle/speed + encoder readback
-│   ├── debug_serial.py             # Raw serial monitor
-│   ├── debug_serial_custom.py      # Custom serial monitor
-│   ├── test_bemf_cl.py             # Automated BEMF single-throttle test
-│   └── test_bemf_multi.py          # Automated BEMF multi-throttle test (0.1/0.3/0.6)
+│   └── foc_6step_view.py           # 6-step commutation: state, ZC, speed, duty
 └── docs/
     ├── ADC_ALIGNMENT_BUG.md        # Left-aligned ADC data issue
     └── DMA_TX_CONTENTION_BUG.md    # DMA UART TX silent frame drops
@@ -183,12 +177,7 @@ Deps: `pyserial matplotlib numpy`. Validate: `python3 -m py_compile <script>.py`
 
 | Tool | Purpose |
 |------|---------|
-| `foc_encoder_view.py` | Encoder CL: Id/Iq, Vq, offset, direction |
-| `foc_bemf_view.py` | BEMF CL: observer angle, flux magnitude, speed |
-| `foc_no_feedback_view.py` | Open-loop: angle/speed + encoder readback |
-| `debug_serial.py` | Raw serial monitor |
-| `test_bemf_cl.py` | Automated BEMF single-throttle test |
-| `test_bemf_multi.py` | Automated BEMF multi-throttle test (0.1/0.3/0.6) |
+| `foc_6step_view.py` | 6-step commutation: state, ZC, speed, duty |
 
 Each tool has **Start Log** / **Stop Motor** / **Reset FC** buttons and a throttle slider.
 

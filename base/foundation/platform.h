@@ -22,6 +22,8 @@ char platform_pwm_init(pwm_port_t port);
 char platform_pwm_send(pwm_port_t port, uint32_t data);
 void platform_pwm_start(void);
 void platform_pwm_stop(void);
+void platform_pwm_float(pwm_port_t port);   // Tri-state a phase (disable H/L)
+void platform_pwm_drive(pwm_port_t port);   // Re-enable a phase (H/L active)
 
 // Encoder (bit-bang SPI)
 void platform_encoder_init(void);

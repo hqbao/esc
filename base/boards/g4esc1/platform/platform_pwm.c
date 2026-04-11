@@ -42,3 +42,15 @@ void platform_pwm_stop(void) {
         HAL_TIM_PWM_Stop(g_pwm_timers[i], g_pwm_channels[i]);
     }
 }
+
+void platform_pwm_float(pwm_port_t port) {
+    // Tri-state: disable both high-side and low-side MOSFETs
+    HAL_TIMEx_PWMN_Stop(g_pwm_timers[port], g_pwm_channels[port]);
+    HAL_TIM_PWM_Stop(g_pwm_timers[port], g_pwm_channels[port]);
+}
+
+void platform_pwm_drive(pwm_port_t port) {
+    // Re-enable complementary PWM on this phase
+    HAL_TIM_PWM_Start(g_pwm_timers[port], g_pwm_channels[port]);
+    HAL_TIMEx_PWMN_Start(g_pwm_timers[port], g_pwm_channels[port]);
+}

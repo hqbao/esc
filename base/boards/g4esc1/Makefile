@@ -33,12 +33,8 @@ MODULES_DIR = ../../../modules
 # VPATH for out-of-tree sources
 VPATH += $(FOUNDATION_DIR)
 VPATH += $(MODULES_DIR)/foc
-VPATH += $(MODULES_DIR)/current_sense
 VPATH += $(MODULES_DIR)/voltage_monitor
-VPATH += $(MODULES_DIR)/encoder
 VPATH += $(MODULES_DIR)/dblink
-VPATH += $(MODULES_DIR)/local_storage
-VPATH += $(MODULES_DIR)/config
 
 # C sources — local (relative to board dir)
 C_SOURCES = \
@@ -52,14 +48,11 @@ platform/module.c \
 platform/platform_common.c \
 platform/platform_pwm.c \
 platform/platform_isr.c \
-platform/platform_encoder.c \
 platform/platform_uart.c \
-platform/platform_storage.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_comp.c \
-Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_cordic.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_cortex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac_ex.c \
@@ -71,8 +64,6 @@ Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_gpio.c \
-Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_opamp.c \
-Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_opamp_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_rcc.c \
@@ -82,23 +73,14 @@ Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_tim_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart_ex.c
 
-# FOC mode selection: no_feedback, encoder, bemf
-FOC_MODE ?= encoder
-FOC_MODE_UPPER := $(shell echo $(FOC_MODE) | tr 'a-z' 'A-Z')
-
 # Out-of-tree sources (found via VPATH)
 EXT_SOURCES = \
 pubsub.c \
 foc.c \
-foc_$(FOC_MODE).c \
-current_sense.c \
 voltage_monitor.c \
-encoder.c \
 dblink.c \
 db_reader.c \
-db_sender.c \
-local_storage.c \
-config.c
+db_sender.c
 
 # ASM sources
 ASM_SOURCES = \
@@ -124,8 +106,7 @@ C_INCLUDES = \
 
 C_DEFS = \
 -DUSE_HAL_DRIVER \
--DSTM32G431xx \
--DFOC_MODE_$(FOC_MODE_UPPER)
+-DSTM32G431xx
 
 ASFLAGS = $(MCU) -Wall -fdata-sections -ffunction-sections
 

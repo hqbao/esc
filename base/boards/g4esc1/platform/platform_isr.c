@@ -26,7 +26,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         ADC1->CR |= ADC_CR_ADSTART;
         for (volatile int i = 0; i < 500; i++) {}       // ~5µs at 170MHz
         if (ADC1->ISR & ADC_ISR_EOC) {
-            uint16_t vbus_raw = (uint16_t)(ADC1->DR >> 4); // left-aligned → 12-bit
+            uint16_t vbus_raw = (uint16_t)(ADC1->DR & 0x0FFF); // right-aligned 12-bit
             ADC1->ISR = ADC_ISR_EOC;
             publish(ADC_REGULAR_COMPLETE, (uint8_t *)&vbus_raw, sizeof(vbus_raw));
         }
@@ -40,19 +40,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 }
 
 // ── ADC injected complete ──────────────────────────────────────────────────
-// Triggered by TIM1_CC4 at the PWM center point (40kHz)
-// Reads 3-phase current + VBUS from ADC1/ADC2 injected channels
-// NOTE: ADC DataAlign=LEFT → raw values are left-shifted by 4, so >>4 to get 12-bit
+// Triggered by TIM1_CC4 at the PWM valley (40kHz) — provides commutation tick.
+// OPAMPs are disabled (6-step mode), so no current values to read.
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
-    if (hadc->Instance != ADC1) return;  // ADC1 triggers first, read both
-
-    uint16_t raw[3];
-    raw[0] = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1) >> 4; // Phase U (OPAMP1→ADC1 CH3)
-    raw[1] = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1) >> 4; // Phase V (OPAMP2→ADC2 CH3)
-    raw[2] = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_2) >> 4; // Phase W (OPAMP3→ADC2 internal)
-
-    publish(ADC_INJECTED_COMPLETE, (uint8_t *)raw, sizeof(raw));
+    if (hadc->Instance != ADC1) return;
+    // Capture comparator outputs NOW, at the PWM valley (center of ON window).
+    // Reading them later in on_tick adds ~4μs latency, pushing past the ON edge
+    // at low duty cycles and giving wrong results.
+    uint8_t comp[3];
+    comp[0] = (HAL_COMP_GetOutputLevel(&hcomp1) == COMP_OUTPUT_LEVEL_HIGH) ? 1 : 0;
+    comp[1] = (HAL_COMP_GetOutputLevel(&hcomp2) == COMP_OUTPUT_LEVEL_HIGH) ? 1 : 0;
+    comp[2] = (HAL_COMP_GetOutputLevel(&hcomp4) == COMP_OUTPUT_LEVEL_HIGH) ? 1 : 0;
+    publish(ADC_INJECTED_COMPLETE, comp, 3);
 }
 
 // ── ADC regular complete ───────────────────────────────────────────────────
