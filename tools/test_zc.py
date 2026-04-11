@@ -8,7 +8,7 @@ DB_CMD_THROTTLE  = 0x01
 DB_CMD_LOG_CLASS = 0x03
 DB_CMD_RESET     = 0x07
 LOG_CLASS_COMMUTATION = 3
-THROTTLE = 0.20
+THROTTLE = 0.10
 
 
 def build_frame(cmd, payload):
@@ -73,8 +73,8 @@ def main():
         print("No serial port found"); sys.exit(1)
     print(f"Port: {port}")
 
-    ser = serial.Serial(port, BAUD, timeout=0.1)
-    time.sleep(0.5)
+    ser = serial.Serial(port, BAUD, timeout=0.5)
+    time.sleep(1.0)
     ser.reset_input_buffer()
 
     q = queue.Queue(maxsize=500)
@@ -92,14 +92,7 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
 
-    # Reset MCU first to ensure clean state
-    print("Resetting MCU...")
-    ser.write(build_frame(DB_CMD_RESET, b''))
-    ser.flush()
-    time.sleep(2)
-    ser.reset_input_buffer()
-
-    # Start: send log class, wait, then throttle
+    # Start: send log class, wait, then throttle (NO reset — board is already running)
     print("Sending start sequence...")
     ser.write(build_frame(DB_CMD_LOG_CLASS, bytes([LOG_CLASS_COMMUTATION])))
     ser.flush()
@@ -109,7 +102,7 @@ def main():
 
     print(f"Throttle = {THROTTLE}, reading telemetry for 12 seconds...\n")
     print(f"{'Time':>5s}  {'State':>10s}  {'Step':>4s}  {'C1':>2s} {'C2':>2s} {'C4':>2s}  "
-          f"{'ZCmap':>6s}  {'ZCwin':>5s}  {'ZCcnt':>5s}  {'Period':>6s}  {'DAC':>5s}  {'Vbus':>5s}")
+          f"{'ZCmap':>6s}  {'ZCwin':>5s}  {'ZCcnt':>5s}  {'Period':>6s}  {'Consec':>7s}  {'Vbus':>5s}")
     print("-" * 90)
 
     t0 = time.time()
@@ -133,11 +126,12 @@ def main():
                 step_period = f[5]
                 zc_count = int(f[6])
                 ramp_period = int(f[7])
-                dac_val = int(f[8])
+                zc_consec = int(f[8])
                 zc_miss = int(f[9])
+                comp_raw = int(f[10]) & 0x07
+                dac_val = (int(f[10]) >> 4) & 0xFFF
                 step_zc_map = int(f[11]) & 0x3F
                 zc_window_sum = (int(f[11]) >> 8) & 0xFF
-                comp_raw = int(f[10]) & 0x07
                 c1 = comp_raw & 1
                 c2 = (comp_raw >> 1) & 1
                 c4 = (comp_raw >> 2) & 1
@@ -149,7 +143,7 @@ def main():
                     map_bin = f'{step_zc_map:06b}'
                     print(f"{now:5.1f}  {sname:>10s}  {step:4d}  {c1:>2d} {c2:>2d} {c4:>2d}  "
                           f"{map_bin:>6s}  {zc_window_sum:3d}/12  {zc_count:5d}  "
-                          f"{step_period:6.0f}  {dac_val:5d}  {vbus:5.1f}")
+                          f"{step_period:6.0f}  con={zc_consec:3d}  {vbus:5.1f}")
 
                     if state == 3 and not reached_cl:
                         reached_cl = True

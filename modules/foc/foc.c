@@ -44,25 +44,28 @@ typedef enum {
 // ── Constants ──────────────────────────────────────────────────────────────
 
 // Startup
-#define ALIGN_TICKS          2000       // 50ms at 40kHz (shorter)
-#define ALIGN_DUTY           0.15f      // 15% alignment pulse
-#define RAMP_INITIAL_PERIOD  2000       // Initial step (50ms, ~3.3 eRPS)
-#define RAMP_FINAL_PERIOD    250        // Target step (6.25ms, ~26.6 eRPS)
-#define RAMP_ACCEL           5          // Very gentle: 0.125ms faster per step
-#define RAMP_DUTY            0.20f      // 20% duty for ramp (reduced for heating)
-#define RAMP_MIN_STEPS       48         // 8 full electrical revolutions minimum
-#define RAMP_MAX_STEPS       300        // Shorter timeout to reduce heating
+#define ALIGN_TICKS          8000       // 200ms at 40kHz
+#define ALIGN_DUTY           0.12f      // 12% alignment pulse
+#define RAMP_INITIAL_PERIOD  1600       // Initial step (40ms)
+#define RAMP_FINAL_PERIOD    320        // Target step (8ms, handoff speed)
+#define RAMP_ACCEL           10         // (1600-320)/10 = 128 steps, ~4s ramp
+#define RAMP_DUTY            0.20f      // 20% duty — needs enough torque for rotor sync
+#define RAMP_MIN_STEPS       48         // 8 electrical revolutions minimum
+#define RAMP_MAX_STEPS       250        // Safety limit (need ~128 steps)
 
 // Closed-loop
 #define DUTY_MAX         0.95f
-#define DUTY_MIN         0.04f          // Low minimum for 22PP motor (high torque per volt)
+#define DUTY_MIN         0.06f          // Keep enough torque after handoff
 #define THROTTLE_START   0.01f
-#define ZC_BLANKING_PCT  0.25f          // Ignore ZC for first 25% of step (PWM noise)
+#define ZC_BLANKING_PCT  0.10f          // Ignore ZC for first 10% of step (PWM noise)
 #define COMM_DELAY_PCT   0.50f          // Commutate at 50% after ZC (30° electrical delay)
 #define SPEED_LPF        0.05f          // Speed estimate filter coefficient
 
 // BEMF zero-crossing threshold
-#define BEMF_DIVIDER_RATIO  0.0449f     // B-G431B-ESC1: 4.7kΩ / (100kΩ + 4.7kΩ)
+// B-G431B-ESC1: Empirical BEMF divider ratio ~0.50 (from ALIGN data: Vbus/2 → ~3600 ADC).
+// Both RAMP and CLOSEDLOOP use level detection with this threshold.
+// Speed control in CLOSEDLOOP uses ZC health (sliding window) + throttle mapping.
+#define BEMF_DIVIDER_RATIO  0.50f       // Vbus/2 threshold for ZC detection
 #define VDDA                3.3f        // Analog reference voltage
 #define ZC_MISS_MAX         6           // Consecutive ZC misses → stall
 
@@ -85,20 +88,15 @@ static const step_pattern_t STEP_TABLE[6] = {
     { PWM_PORT1, PWM_PORT2, PWM_PORT3 },  // Step 5: U+, V-, W float
 };
 
-// Which comparator to read for each step's floating phase
-// COMP1 = Phase U, COMP2 = Phase V, COMP4 = Phase W
-static COMP_HandleTypeDef *const COMP_TABLE[6] = {
-    &hcomp2, &hcomp1, &hcomp4, &hcomp2, &hcomp1, &hcomp4,
-};
-
 // Expected comparator output AFTER zero-crossing for each step.
 // Derived from which phase was previously driven:
-//   Step 0: V was LOW (step 5: V−) → V rises through Vbus/2 → RISING  → expect 1
-//   Step 1: U was HIGH (step 0: U+) → U falls through Vbus/2 → FALLING → expect 0
-//   Step 2: W was LOW (step 1: W−) → W rises                 → RISING  → expect 1
-//   Step 3: V was HIGH (step 2: V+) → V falls                 → FALLING → expect 0
-//   Step 4: U was LOW (step 3: U−) → U rises                 → RISING  → expect 1
-//   Step 5: W was HIGH (step 4: W+) → W falls                 → FALLING → expect 0
+//   Step 0: V was LOW (step 5: V−) → V rises through Vbus/2 → RISING  → expect 0
+//   Step 1: U was HIGH (step 0: U+) → U falls through Vbus/2 → FALLING → expect 1
+//   Step 2: W was LOW (step 1: W−) → W rises                 → RISING  → expect 0
+//   Step 3: V was HIGH (step 2: V+) → V falls                 → FALLING → expect 1
+//   Step 4: U was LOW (step 3: U−) → U rises                 → RISING  → expect 0
+//   Step 5: W was HIGH (step 4: W+) → W falls                 → FALLING → expect 1
+//
 static const uint32_t ZC_POLARITY[6] = {
     1, 0, 1, 0, 1, 0,
 };
@@ -212,19 +210,38 @@ static uint8_t read_comparator(uint8_t step) {
     return g_comp_cache[COMP_CACHE_IDX[step]];
 }
 
+static uint8_t detect_zc_edge(uint8_t step, uint8_t comp_val) {
+    uint8_t expected = (uint8_t)ZC_POLARITY[step];
+
+    // Require an opposite-polarity pre-state before accepting the crossing.
+    if (!g_zc_pre_cross) {
+        if (comp_val != expected) {
+            g_zc_pre_cross = 1;
+        }
+        return 0;
+    }
+
+    // Single-sample confirm after pre-cross (hardware comparator output
+    // is already captured at PWM valley — extra debounce causes missed ZCs).
+    if (comp_val == expected) {
+        if (++g_zc_debounce >= 1) {
+            return 1;
+        }
+    } else {
+        g_zc_debounce = 0;
+    }
+
+    return 0;
+}
+
 static void update_bemf_threshold(float duty) {
-    // Threshold = Vbus/2 × divider_ratio
-    // At the PWM valley (center of ON window), the motor neutral is at Vbus/2.
-    // The comparator values are now captured there (ISR cache), so the threshold
-    // should match the true neutral point — no duty scaling needed.
     (void)duty;
     float v_threshold = g_vbus * 0.5f * BEMF_DIVIDER_RATIO;
-    uint32_t dac_val = (uint32_t)(v_threshold / VDDA * 4095.0f);
-    if (dac_val < 1) dac_val = 1;
-    if (dac_val > 4095) dac_val = 4095;
-    HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
-    HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_2, DAC_ALIGN_12B_R, dac_val);
-    g_dac_val = dac_val;
+    uint32_t threshold = (uint32_t)(v_threshold / VDDA * 4095.0f);
+    if (threshold < 100) threshold = 100;
+    if (threshold > 4000) threshold = 4000;
+    g_bemf_threshold = (uint16_t)threshold;
+    g_dac_val = threshold;  // Reuse for logging
     g_duty = duty;
 }
 
@@ -305,11 +322,12 @@ static void on_tick(uint8_t *data, size_t size) {
         apply_step(g_step, RAMP_DUTY);
 
         // BEMF zero-crossing: after blanking, check if comp matches expected polarity.
-        // Comp values are ISR-cached at PWM valley (center of ON window).
+        // Simple level check in RAMP — false positives are harmless since timing
+        // is forced, and the 10/12 sliding window filters random matches.
         uint32_t blanking = (uint32_t)((float)g_ramp_period * ZC_BLANKING_PCT);
         if (!g_zc_detected && g_step_ticks > blanking) {
             uint8_t comp_val = read_comparator(g_step);
-            if (comp_val == ZC_POLARITY[g_step]) {
+            if (comp_val == (uint8_t)ZC_POLARITY[g_step]) {
                 g_zc_detected = 1;
                 g_zc_tick = g_step_ticks;
                 g_zc_count++;
@@ -342,11 +360,12 @@ static void on_tick(uint8_t *data, size_t size) {
                 g_ramp_period = RAMP_FINAL_PERIOD;
             }
 
-            // Transition: fast enough AND 10/12 recent steps have valid ZC
-            // (allows 1 step with weak BEMF while still confirming overall sync)
+            // Transition: fast enough AND 8/12 recent steps have valid ZC
+            // (at startup speed, BEMF is weak and some steps may miss ZC —
+            // CLOSEDLOOP uses forced timing + ZC feedback, so partial detection is OK)
             if (g_ramp_steps >= RAMP_MIN_STEPS &&
                 g_ramp_period <= RAMP_FINAL_PERIOD &&
-                g_zc_window_sum >= 10) {
+                g_zc_window_sum >= 8) {
                 g_state = STATE_CLOSEDLOOP;
                 g_step_period = g_ramp_period;
                 g_zc_miss = 0;
@@ -361,10 +380,9 @@ static void on_tick(uint8_t *data, size_t size) {
         break;
     }
 
-    // ── CLOSEDLOOP: Forced timing with BEMF zero-crossing feedback ───
-    // Like RAMP, we ALWAYS commutate at g_step_period (forced timing).
-    // ZC detection only adjusts the period estimate for future steps.
-    // This prevents a single bad ZC read from collapsing the period.
+    // ── CLOSEDLOOP: Forced timing with ZC-health speed control ────────
+    // Commutation at forced step_period. ZC level detection validates sync.
+    // Period adjusts based on ZC reliability (sliding window) + throttle demand.
     case STATE_CLOSEDLOOP: {
         float duty = LIMIT(g_throttle, DUTY_MIN, DUTY_MAX);
         apply_step(g_step, duty);
@@ -373,28 +391,29 @@ static void on_tick(uint8_t *data, size_t size) {
             update_bemf_threshold(duty);
         }
 
-        // Blanking: ignore comparator during first part of step (PWM switching noise)
+        // Blanking: 10% of step period
         uint32_t blanking = (uint32_t)((float)g_step_period * ZC_BLANKING_PCT);
+        if (blanking < 4) blanking = 4;
 
-        // BEMF zero-crossing: comp values are ISR-cached at PWM ON center.
+        // BEMF zero-crossing: level detection (same as RAMP)
         if (!g_zc_detected && g_step_ticks > blanking) {
             uint8_t comp_val = read_comparator(g_step);
-            if (comp_val == ZC_POLARITY[g_step]) {
+            if (comp_val == (uint8_t)ZC_POLARITY[g_step]) {
                 g_zc_detected = 1;
                 g_zc_tick = g_step_ticks;
                 g_zc_count++;
-                g_zc_miss = 0;
             }
         }
 
-        // Commutate at expected period (forced timing, like RAMP)
+        // Commutate at forced period
         if (g_step_ticks >= g_step_period) {
+            // Track ZC in sliding window (reuse RAMP's mechanism)
+            g_zc_window_sum -= g_zc_window[g_zc_window_idx];
+            g_zc_window[g_zc_window_idx] = g_zc_detected ? 1 : 0;
+            g_zc_window_sum += g_zc_window[g_zc_window_idx];
+            g_zc_window_idx = (g_zc_window_idx + 1) % 12;
+
             if (g_zc_detected) {
-                // ZC should occur at step midpoint → actual period ≈ 2 × zc_tick
-                uint32_t est = g_zc_tick * 2;
-                if (est < 50) est = 50;
-                if (est > 10000) est = 10000;
-                g_step_period = (g_step_period * 3 + est) / 4;
                 g_zc_miss = 0;
             } else {
                 g_zc_miss++;
@@ -403,6 +422,23 @@ static void on_tick(uint8_t *data, size_t size) {
                     reset_state();
                     break;
                 }
+            }
+
+            // Speed control: target period from throttle
+            // Map throttle 0.06..1.0 → period 320..20 (20.8..333 ERPS)
+            float t_norm = (duty - DUTY_MIN) / (DUTY_MAX - DUTY_MIN);
+            uint32_t target_period = 320 - (uint32_t)(t_norm * 300.0f);
+            if (target_period < 20) target_period = 20;
+            if (target_period > 320) target_period = 320;
+
+            // Adjust period toward target, gated by ZC health
+            if (g_zc_window_sum >= 8 && g_step_period > target_period) {
+                // Reliable ZC + below target speed → accelerate
+                g_step_period -= 1;
+            } else if (g_zc_window_sum < 6 || g_step_period < target_period) {
+                // Poor ZC or above target speed → decelerate
+                g_step_period += 2;
+                if (g_step_period > 10000) g_step_period = 10000;
             }
 
             float erps_raw = (float)PWM_FREQ / ((float)g_step_period * 6.0f);
@@ -429,12 +465,20 @@ static void on_scheduler_25hz(uint8_t *data, size_t size) {
     switch (g_log_class) {
     case LOG_CLASS_COMMUTATION: {
         // [0]state [1]step [2]speed_erps [3]duty [4]Vbus [5]step_period
-        // [6]zc_count [7]ramp_period [8]dac_val [9]zc_miss
-        // [10]all 3 comp raw: c1|(c2<<1)|(c4<<2)
+        // [6]zc_count [7]ramp_period [8]ramp_zc_consec [9]zc_miss|MOE|CCER
+        // [10]comp raw: c1|(c2<<1)|(c4<<2) | (threshold << 4)
         // [11]step_zc_map | (zc_window_sum << 8)
+        // For ADC-based BEMF: also log raw ADC values of all 3 phases
         uint8_t c1 = g_comp_cache[0];
         uint8_t c2 = g_comp_cache[1];
         uint8_t c4 = g_comp_cache[2];
+        // Pack: [7:0]=zc_miss, [8]=MOE, [19:9]=CCER lower 11 bits
+        uint32_t moe = (TIM1->BDTR & TIM_BDTR_MOE) ? 1 : 0;
+        uint32_t ccer = TIM1->CCER & 0x7FF; // CH1/1N/CH2/2N/CH3/3N enable bits
+        // Pack all 3 BEMF ADC values for diagnostic
+        uint32_t bu = g_bemf_raw[0];  // Phase U (PA4)
+        uint32_t bv = g_bemf_raw[1];  // Phase V (PC4)
+        uint32_t bw = g_bemf_raw[2];  // Phase W (PB11)
         log_data[0]  = (float)g_state;
         log_data[1]  = (float)g_step;
         log_data[2]  = g_speed_erps;
@@ -443,10 +487,12 @@ static void on_scheduler_25hz(uint8_t *data, size_t size) {
         log_data[5]  = (float)g_step_period;
         log_data[6]  = (float)g_zc_count;
         log_data[7]  = (float)g_ramp_period;
-        log_data[8]  = (float)g_dac_val;
-        log_data[9]  = (float)g_zc_miss;
-        log_data[10] = (float)(c1 | (c2 << 1) | (c4 << 2));
-        log_data[11] = (float)(g_step_zc_map | (g_zc_window_sum << 8));
+        log_data[8]  = (float)g_ramp_zc_consec;
+        log_data[9]  = (float)((g_zc_miss & 0xFF) | (moe << 8) | (ccer << 9));
+        // f[10]: bemf_u[11:0] | bemf_v[23:12]
+        log_data[10] = (float)(bu | (bv << 12));
+        // f[11]: bemf_w[11:0] | zc_map[17:12] | zc_win[22:18] | threshold_hi[23]
+        log_data[11] = (float)(bw | ((g_step_zc_map & 0x3F) << 12) | ((g_zc_window_sum & 0x1F) << 18));
         ok = 1;
         break;
     }
@@ -474,13 +520,10 @@ void foc_setup(void) {
     platform_pwm_init(PWM_PORT3);
     htim1.Instance->CCR4 = 1;
 
-    // DAC3 + comparators run permanently (no per-throttle start/stop needed)
-    HAL_DAC_Start(&hdac3, DAC_CHANNEL_1);
-    HAL_DAC_Start(&hdac3, DAC_CHANNEL_2);
+    // BEMF sensing via ADC2 on PA4/PC4/PB11 (NOT comparators on PA1/PA7/PB0).
+    // The hardware COMPs read current-sense OPAmp inputs, not BEMF dividers.
+    bemf_adc_init();
     update_bemf_threshold(ALIGN_DUTY);
-    HAL_COMP_Start(&hcomp1);
-    HAL_COMP_Start(&hcomp2);
-    HAL_COMP_Start(&hcomp4);
 
     subscribe(FOC_RELEASE, on_foc_release);
     subscribe(MOTOR_THROTTLE, on_motor_throttle);

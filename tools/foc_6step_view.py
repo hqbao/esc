@@ -364,7 +364,7 @@ def main():
     btn_start = Button(ax_b1, 'Start', color=BTN_GRN, hovercolor='#2ea043')
     btn_stop  = Button(ax_b3, 'Stop',  color=BTN_RED, hovercolor='#f85149')
     btn_rst   = Button(ax_b4, 'Reset', color=BTN_GRY, hovercolor='#484f58')
-    slider_thr = Slider(ax_thr, 'Throttle', 0.0, 1.0, valinit=0.05, color=ACCENT)
+    slider_thr = Slider(ax_thr, 'Throttle', 0.0, 1.0, valinit=0.10, color=ACCENT)
 
     for b in [btn_start, btn_stop, btn_rst]:
         b.label.set_color(TEXT)

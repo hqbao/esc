@@ -1,9 +1,10 @@
 # ESC — Brushless Motor Controller
 
-Field-Oriented Control (FOC) firmware for the **B-G431B-ESC1** discovery kit (STM32G431CBU6).
+6-step trapezoidal (120° block) BLDC motor controller for the **B-G431B-ESC1** discovery kit (STM32G431CBU6).
 Built from scratch with the same PubSub architecture as the [flight-controller](../flight-controller/) project.
 
-Three FOC modes selectable at build time: **encoder**, **BEMF sensorless**, and **no-feedback** (open-loop only).
+Sensorless BEMF zero-crossing detection via **ADC2** on the hardware BEMF divider pins (PA4/PC4/PB11).
+Startup: forced ALIGN → RAMP → CLOSEDLOOP with ZC-health gated speed control.
 
 ## Hardware
 
@@ -13,7 +14,9 @@ Three FOC modes selectable at build time: **encoder**, **BEMF sensorless**, and 
 | MCU | STM32G431CBU6, Cortex-M4F, 170 MHz |
 | Flash / RAM | 128 KB / 32 KB |
 | Current sense | 3-shunt (3 mΩ), OPAMP PGA ×16 |
-| Encoder | AS5048A (14-bit, bit-bang SPI) |
+| BEMF sensing | ADC2: PA4 (Phase U), PC4 (Phase V), PB11 (Phase W) |
+| BEMF divider ratio | 0.50 (empirical, threshold = Vbus/2 × 0.50) |
+| Encoder | AS5048A (14-bit, bit-bang SPI) — unused in sensorless mode |
 | Comms | USART2 @ 19200 baud (DMA TX+RX, IDLE detection) |
 | PWM | TIM1 center-aligned, 40 kHz |
 | Protection | Comparator-based overcurrent → TIM1 BKIN |
@@ -57,6 +60,7 @@ esc/
 │   └── foc_6step_view.py           # 6-step commutation: state, ZC, speed, duty
 └── docs/
     ├── ADC_ALIGNMENT_BUG.md        # Left-aligned ADC data issue
+    ├── BEMF_HARDWARE_DISCOVERY.md  # BEMF pins: COMPs vs ADC2
     └── DMA_TX_CONTENTION_BUG.md    # DMA UART TX silent frame drops
 ```
 
@@ -93,46 +97,34 @@ subscribe(SENSOR_ENCODER, on_encoder_data);
 | `NOTIFY_LOG_CLASS` | `uint8_t` | On demand | Select active log stream |
 | `SEND_LOG` | `float[8]` | 25 Hz | Telemetry to Python tools |
 
-### FOC Control Loop (40 kHz)
+### Commutation Loop (40 kHz)
 
 ```
 ADC injected ISR (TIM1_CC4)
   → current_sense: raw ADC → calibrated Amps → SENSOR_PHASE_CURRENT
-    → foc: Clarke → Park → voltage-mode Vd/Vq → Inv Park → Inv Clarke → PWM duty
+  → BEMF ADC2: read floating phase → compare vs threshold → cache comp[3]
+    → foc (on_tick): apply_step → ZC detection → forced commutation → speed control
 ```
 
-### FOC Modes
+6-step trapezoidal: only 2 of 3 phases driven at any time, 3rd floats. BEMF zero-crossing on the floating phase triggers timing validation.
 
-| Mode | Build Command | Angle Source | Use Case |
-|------|--------------|-------------|----------|
-| Encoder | `bash build.sh encoder` | AS5048A encoder | Motors with encoder attached |
-| BEMF | `bash build.sh bemf` | Sensorless flux observer | Any BLDC motor |
-| No-feedback | `bash build.sh no_feedback` | Open-loop only | Testing / diagnostics |
-
-Only one mode compiles per build. `foc.h` defines `FOC_MODE_*` guards. Default is encoder if no mode specified.
-
-### State Machine (BEMF mode shown)
+### State Machine
 
 | State | ID | Description |
 |-------|----|-------------|
-| IDLE | 0 | Waiting, PWM off |
-| ALIGN | 1 | Lock rotor at 0° |
-| RAMP | 2 | Open-loop acceleration |
-| OPENLOOP | 3 | Steady OL, observer runs in background |
-| BLENDING | 4 | Gradual OL→CL angle/voltage blend (0.5s) |
-| CLOSEDLOOP | 5 | Full sensorless commutation |
+| IDLE | 0 | Motor stopped, PWM off |
+| ALIGN | 1 | Lock rotor at 0° (200ms, 12% duty) |
+| RAMP | 2 | Forced commutation ramp-up (~4s, period 1600→320) |
+| CLOSEDLOOP | 3 | Forced timing + ZC-health gated speed control |
 
 ### Log Classes
 
-| ID | Constant | Mode | Payload |
-|----|----------|------|---------|
-| 1 | `LOG_CLASS_FOC` | Encoder | enc_elec, enc_mech, theta, offset, ... |
-| 2 | `LOG_CLASS_CURRENT` | All | state, Iα, Iβ, enc_elec, Vbus, ... |
-| 3 | `LOG_CLASS_VOLTAGE` | BEMF/No-FB | state, Id, Iq, theta, bemf_theta, enc_elec, Iα, Iβ |
-| 4 | `LOG_CLASS_RAW_CURRENT` | — | Ia, Ib, Ic (raw phase currents) |
-| 5 | `LOG_CLASS_ENCODER` | Encoder | state, Id, Iq, Vq, enc_offset, enc_dir, ... |
-| 6 | `LOG_CLASS_OPENLOOP` | No-FB | OL angle, speed, encoder readback, ... |
-| 8 | `LOG_CLASS_BEMF` | BEMF | bemf_theta, ol_theta, enc_elec, flux_mag, speed, ... |
+| ID | Constant | Payload |
+|----|----------|---------|
+| 1 | `LOG_CLASS_FOC` | enc_elec, enc_mech, theta, offset, ... |
+| 2 | `LOG_CLASS_CURRENT` | state, Iα, Iβ, enc_elec, Vbus, ... |
+| 3 | `LOG_CLASS_COMMUTATION` | state, step, speed, duty, Vbus, step_period, zc_count, ramp_period, bemf_raw[3], zc_map, zc_win |
+| 4 | `LOG_CLASS_RAW_CURRENT` | Ia, Ib, Ic (raw phase currents) |
 
 ## Constants
 
@@ -145,9 +137,15 @@ Only one mode compiles per build. `foc.h` defines `FOC_MODE_*` guards. Default i
 | `ADC_VREF` | 3.3 V | ADC reference voltage |
 | `ADC_RESOLUTION` | 4096 | 12-bit ADC |
 | `VBUS_DIVIDER_RATIO` | 0.09626 | R1=169k, R2=18k |
-| `MOTOR_RESISTANCE` | 0.5 Ω | Phase resistance (tune per motor) |
-| `OBSERVER_R` | 0.05 | BEMF observer resistance (may differ from phase R) |
-| `OBSERVER_WC` | 20.0 | BEMF leaky integrator cutoff (rad/s) |
+| `BEMF_DIVIDER_RATIO` | 0.50 | Empirical — threshold = Vbus × 0.5 × 0.50 |
+| `ALIGN_TICKS` | 8000 | 200ms at 40kHz |
+| `ALIGN_DUTY` | 0.12 | 12% alignment pulse |
+| `RAMP_INITIAL_PERIOD` | 1600 | 40ms initial step |
+| `RAMP_FINAL_PERIOD` | 320 | 8ms target (handoff speed) |
+| `RAMP_ACCEL` | 10 | Period decrease per step → ~128 steps, ~4s ramp |
+| `RAMP_DUTY` | 0.20 | 20% duty during ramp |
+| `ZC_BLANKING_PCT` | 0.10 | Ignore first 10% of step (PWM noise) |
+| `ZC_MISS_MAX` | 6 | Consecutive misses → stall protection |
 
 ## ADC Architecture
 
@@ -155,17 +153,15 @@ Only one mode compiles per build. `foc.h` defines `FOC_MODE_*` guards. Default i
 
 - **Injected group** (40 kHz, TIM1_CC4 triggered): 3 phase currents via OPAMPs
 - **Regular group** (100 Hz, software polled): Bus voltage + temperature
+- **ADC2** (40 kHz, read in TIM1_CC4 ISR): BEMF on floating phase (PA4/PC4/PB11), software comparison against threshold
+
+**CRITICAL**: Hardware comparators (COMP1/2/4) on this board read **current-sense OPAmp outputs**, NOT BEMF dividers. See [docs/BEMF_HARDWARE_DISCOVERY.md](docs/BEMF_HARDWARE_DISCOVERY.md).
 
 ## Building & Flashing
 
 ```bash
-# Build (default: encoder mode)
+# Build
 cd base/boards/g4esc1 && ./build.sh
-
-# Build specific mode
-cd base/boards/g4esc1 && bash build.sh encoder
-cd base/boards/g4esc1 && bash build.sh bemf
-cd base/boards/g4esc1 && bash build.sh no_feedback
 
 # Build + flash via ST-Link
 cd base/boards/g4esc1 && ./build-flash.sh
