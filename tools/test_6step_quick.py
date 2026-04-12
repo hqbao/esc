@@ -12,7 +12,7 @@ LOG_CLASS_NONE = 0
 
 STATE_NAMES = {0: 'IDLE', 1: 'ALIGN', 2: 'RAMP', 3: 'CLOSEDLOOP'}
 THROTTLE = 0.08   # 8%
-TEST_DURATION = 8  # seconds
+TEST_DURATION = 15  # seconds (longer for slow ramp)
 
 def find_port():
     for p, d, h in sorted(serial.tools.list_ports.comports()):
@@ -99,8 +99,8 @@ def main():
     max_window = 0
     reached_closedloop = False
 
-    print(f"\n{'t':>5s}  {'State':<12s}  {'Step':>4s}  {'eRPS':>7s}  {'Duty':>5s}  {'Vbus':>5s}  {'Period':>6s}  {'ZC_cnt':>6s}  {'Ramp_p':>6s}  {'Consec':>6s}  {'Miss':>4s}  {'Comp':>4s}  {'Map':>6s}  {'Win':>3s}")
-    print("-" * 110)
+    print(f"\n{'t':>5s}  {'State':<12s}  {'Step':>4s}  {'eRPS':>7s}  {'Duty':>5s}  {'Vbus':>5s}  {'Period':>6s}  {'ZC_cnt':>6s}  {'Ramp_p':>6s}  {'Consec':>6s}  {'Miss':>4s}  {'Comp':>4s}  {'Map':>6s}  {'Win':>3s}  {'BU':>5s}  {'BV':>5s}  {'BW':>5s}")
+    print("-" * 140)
 
     try:
         while time.time() - t0 < TEST_DURATION:
@@ -122,8 +122,13 @@ def main():
                     zc_miss = int(f[9])
                     comp_raw = int(f[10])
                     packed11 = int(f[11])
-                    zc_map = packed11 & 0x3F
-                    zc_window = (packed11 >> 8) & 0xFF
+                    # f[10]: bemf_u[11:0] | bemf_v[23:12]
+                    bemf_u = comp_raw & 0xFFF
+                    bemf_v = (comp_raw >> 12) & 0xFFF
+                    # f[11]: bemf_w[11:0] | zc_map[17:12] | zc_win[22:18]
+                    bemf_w = packed11 & 0xFFF
+                    zc_map = (packed11 >> 12) & 0x3F
+                    zc_window = (packed11 >> 18) & 0x1F
 
                     max_zc = max(max_zc, zc_count)
                     max_window = max(max_window, zc_window)
@@ -138,10 +143,10 @@ def main():
                     count += 1
                     if count % 3 == 0:  # Print every 3rd frame (~120ms)
                         elapsed = time.time() - t0
-                        c1 = comp_raw & 1
-                        c2 = (comp_raw >> 1) & 1
-                        c4 = (comp_raw >> 2) & 1
-                        print(f"{elapsed:5.1f}  {sname:<12s}  {step:4d}  {speed:7.2f}  {duty:5.2f}  {vbus:5.1f}  {period:6d}  {zc_count:6d}  {ramp_period:6d}  {consec:6d}  {zc_miss:4d}  {c1}{c2}{c4}  {zc_map:06b}  {zc_window:3d}")
+                        c1 = (bemf_u > 470)  # approximate above/below threshold (10-bit ADC)
+                        c2 = (bemf_v > 470)
+                        c4 = (bemf_w > 470)
+                        print(f"{elapsed:5.1f}  {sname:<12s}  {step:4d}  {speed:7.2f}  {duty:5.2f}  {vbus:5.1f}  {period:6d}  {zc_count:6d}  {ramp_period:6d}  {consec:6d}  {zc_miss:4d}  {int(c1)}{int(c2)}{int(c4)}  {zc_map:06b}  {zc_window:3d}  {bemf_u:5d}  {bemf_v:5d}  {bemf_w:5d}")
 
         # Stop motor
         print(f"\n--- Stopping motor ---")
@@ -170,7 +175,7 @@ def main():
         print(f"  Check comp_raw column: if always 000 or 111, DAC threshold or wiring issue.")
     elif not reached_closedloop:
         print(f"\n  DIAGNOSIS: Got ZCs but never reached CLOSEDLOOP.")
-        print(f"  ZC window peaked at {max_window}/12 (need 10).")
+        print(f"  ZC window peaked at {max_window}/12 (need 7).")
     else:
         print(f"\n  SUCCESS: Motor reached closed-loop commutation!")
 

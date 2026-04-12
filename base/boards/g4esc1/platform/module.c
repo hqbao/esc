@@ -3,35 +3,39 @@
 
 #include "platform_hw.h"
 #include <platform.h>
-#include <voltage_monitor/voltage_monitor.h>
 #include <foc/foc.h>
 #include <dblink/dblink.h>
 
 
 // Start only the hardware needed for 6-step sensorless BEMF commutation
 static void hw_init(void) {
-    // NO OPAMPs — they share PA1/PA7/PB0 with BEMF voltage dividers.
-    // Starting OPAMPs overrides the BEMF signal on comparator inputs.
+    // ADC2 calibration (must happen before any conversion, ADC disabled)
+    HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
-    // Comparators and DAC3 are managed by foc.c at motor start/stop.
-    // Do NOT start them here — foc_6step sets DAC3 to Vbus/2 (BEMF threshold),
-    // NOT the overcurrent threshold (1788) that was previously here.
-
-    // ADC calibration (must happen before any conversion, ADC disabled)
-    HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+    // PB5 (GPIO_BEMF): drive LOW to ground the BEMF divider reference.
+    // CubeMX already configures PB5 as output-low in MX_GPIO_Init(), so this
+    // is just explicit confirmation. Do NOT set to input (high-Z) — the divider
+    // needs a defined reference.
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
 }
 
 void platform_setup(void) {
     hw_init();
 
     // Module setup — each subscribes to PubSub topics
-    voltage_monitor_setup();
     foc_setup();
     dblink_setup();
 
-    // Start ADC injected conversions (triggered by TIM1_CC4)
-    // Provides the 40kHz tick for commutation even without current sensing
-    HAL_ADCEx_InjectedStart_IT(&hadc1);
+    // Start ADC2 DMA circular — continuously samples BEMF channels
+    extern volatile uint16_t g_bemf_dma[3];
+    HAL_ADC_Start_DMA(&hadc2, (uint32_t *)g_bemf_dma, 3);
+    // Disable DMA transfer interrupts — buffer is read on demand at PWM valley
+    __HAL_DMA_DISABLE_IT(hadc2.DMA_Handle, DMA_IT_TC | DMA_IT_HT);
+
+    // Enable TIM1 CC4 interrupt for 40kHz commutation tick at PWM valley
+    HAL_NVIC_SetPriority(TIM1_CC_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_CC4);
 
     // Start TIM6 scheduler (1kHz)
     HAL_TIM_Base_Start_IT(&htim6);

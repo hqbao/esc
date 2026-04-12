@@ -52,10 +52,7 @@ platform/platform_uart.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc_ex.c \
-Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_comp.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_cortex.c \
-Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac.c \
-Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dma.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dma_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_exti.c \
@@ -77,7 +74,6 @@ Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart_ex.c
 EXT_SOURCES = \
 pubsub.c \
 foc.c \
-voltage_monitor.c \
 dblink.c \
 db_reader.c \
 db_sender.c
